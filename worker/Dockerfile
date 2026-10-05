@@ -2,7 +2,7 @@
 # root: docker build -f worker/Dockerfile .
 FROM node:20-bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates \
+ && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates aria2 \
  && pip3 install --no-cache-dir --break-system-packages runpod \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
