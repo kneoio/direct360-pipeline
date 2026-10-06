@@ -1,0 +1,142 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { eacToEquirectFilter, stitchGopro, stitchPreset } from '../src/gopro.js';
+import { buildMatrix } from '../src/matrix.js';
+
+test('stitch preset is medium unless D360_STITCH_PRESET names an x264 preset', () => {
+  assert.equal(stitchPreset({}), 'medium');
+  assert.equal(stitchPreset({ D360_STITCH_PRESET: 'veryfast' }), 'veryfast');
+  assert.throws(() => stitchPreset({ D360_STITCH_PRESET: 'placebo' }), /D360_STITCH_PRESET/);
+});
+
+test('a chunked stitch trims both lenses to the same frame count', () => {
+  const filter = eacToEquirectFilter(0, 4, { width: 4096, height: 1344, face: 1344, overlap: 128 }, 12);
+  assert.match(filter, /\[0:0\]trim=end_frame=12,setpts=PTS-STARTPTS,split=7/);
+  assert.match(filter, /\[0:4\]trim=end_frame=12,setpts=PTS-STARTPTS,split=7/);
+  assert.match(filter, /\[fin0\]crop=/);
+  assert.match(filter, /\[bin0\]crop=/);
+  assert.match(filter, /\[out\]$/);
+  const whole = eacToEquirectFilter(0, 4, { width: 4096, height: 1344, face: 1344, overlap: 128 });
+  assert.doesNotMatch(whole, /trim=/);
+  assert.match(whole, /\[0:0\]crop=/);
+});
+
+function ffmpeg(args) {
+  const result = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args], { encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(result.stderr || `ffmpeg exited ${result.status}`);
+}
+
+function ffprobe(args) {
+  const result = spawnSync('ffprobe', ['-v', 'error', ...args], { encoding: 'utf8' });
+  if (result.status !== 0) throw new Error(result.stderr || `ffprobe exited ${result.status}`);
+  return result.stdout;
+}
+
+test('chunked stitch keeps the source frame count and puts an IDR on every chunk', { timeout: 180000 }, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-stitch-test-'));
+  const previous = {
+    preset: process.env.D360_STITCH_PRESET,
+    chunk: process.env.D360_CHUNK_MIN_SEC,
+    parallel: process.env.D360_MAX_PARALLEL,
+  };
+  process.env.D360_STITCH_PRESET = 'ultrafast';
+  process.env.D360_CHUNK_MIN_SEC = '0.2';
+  process.env.D360_MAX_PARALLEL = '2';
+  try {
+    const src = path.join(tmp, 'dual.mp4');
+    ffmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=4096x1344:rate=10:duration=0.6',
+      '-f', 'lavfi', '-i', 'testsrc2=size=4096x1344:rate=10:duration=0.6',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=0.6',
+      '-map', '0:v', '-map', '2:a', '-map', '1:v',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-g', '2',
+      '-c:a', 'aac', '-shortest', src,
+    ]);
+    const out = path.join(tmp, 'equirect.mp4');
+    const lines = [];
+    const stitched = await stitchGopro(src, out, { log: (line) => lines.push(line) });
+    assert.ok(stitched.chunks > 1, lines.join('\n'));
+    assert.equal(stitched.frames, 6);
+    assert.equal(stitched.preset, 'ultrafast');
+    const facts = JSON.parse(ffprobe([
+      '-count_packets', '-select_streams', 'v:0',
+      '-show_entries', 'stream=nb_read_packets,codec_name',
+      '-show_entries', 'format=duration',
+      '-of', 'json', out,
+    ]));
+    assert.equal(Number(facts.streams[0].nb_read_packets), 6);
+    assert.equal(facts.streams[0].codec_name, 'h264');
+    assert.ok(Math.abs(Number(facts.format.duration) - 0.6) < 1.5 / 10);
+    const streams = JSON.parse(ffprobe([
+      '-show_entries', 'stream=codec_type,codec_name',
+      '-of', 'json', out,
+    ])).streams;
+    assert.ok(streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
+    const keys = ffprobe([
+      '-select_streams', 'v:0',
+      '-show_entries', 'frame=key_frame',
+      '-of', 'csv=p=0', out,
+    ]).trim().split('\n').map((line) => line.split(',')[0]);
+    assert.equal(keys.length, 6);
+    assert.equal(keys[0], '1');
+    assert.ok(keys.includes('1', 1), `expected an IDR after the first frame, got ${keys.join(',')}`);
+    assert.ok(lines.some((line) => line.startsWith('peak concurrent ffmpeg:')));
+  } finally {
+    if (previous.preset == null) delete process.env.D360_STITCH_PRESET;
+    else process.env.D360_STITCH_PRESET = previous.preset;
+    if (previous.chunk == null) delete process.env.D360_CHUNK_MIN_SEC;
+    else process.env.D360_CHUNK_MIN_SEC = previous.chunk;
+    if (previous.parallel == null) delete process.env.D360_MAX_PARALLEL;
+    else process.env.D360_MAX_PARALLEL = previous.parallel;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('matrix and proxy keep frame count, size, and audio', { timeout: 120000 }, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-matrix-test-'));
+  try {
+    const src = path.join(tmp, 'equirect.mp4');
+    ffmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=640x320:rate=30:duration=2',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-shortest', src,
+    ]);
+    const grid = path.join(tmp, 'grid.mp4');
+    const proxy = path.join(tmp, 'proxy.mp4');
+    await buildMatrix(src, grid, { grid: '3x7', format: 'youtube', proxyOut: proxy });
+    const gridFrames = Number(JSON.parse(ffprobe([
+      '-count_packets', '-select_streams', 'v:0',
+      '-show_entries', 'stream=nb_read_packets',
+      '-of', 'json', grid,
+    ])).streams[0].nb_read_packets);
+    const proxyInfo = JSON.parse(ffprobe([
+      '-count_packets', '-select_streams', 'v:0',
+      '-show_entries', 'stream=nb_read_packets,width,height',
+      '-show_entries', 'format=duration',
+      '-of', 'json', proxy,
+    ]));
+    assert.equal(gridFrames, Math.round(2 * 12));
+    assert.equal(Number(proxyInfo.streams[0].nb_read_packets), 60);
+    assert.equal(proxyInfo.streams[0].width, 2048);
+    assert.equal(proxyInfo.streams[0].height, 1024);
+    assert.ok(Math.abs(Number(proxyInfo.format.duration) - 2) < 1.5 / 30);
+    const audio = JSON.parse(ffprobe([
+      '-show_entries', 'stream=codec_type,codec_name',
+      '-of', 'json', proxy,
+    ])).streams;
+    assert.ok(audio.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
+    const gridKeys = ffprobe([
+      '-select_streams', 'v:0',
+      '-show_entries', 'frame=key_frame',
+      '-of', 'csv=p=0', grid,
+    ]).trim().split('\n').map((line) => line.split(',')[0]);
+    assert.equal(gridKeys[0], '1');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
