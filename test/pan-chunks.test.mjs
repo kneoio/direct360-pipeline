@@ -69,11 +69,16 @@ test('a chunked yaw pan matches per-frame v360 and the joined frame count', { ti
     process.env.D360_CHUNK_MIN_SEC = '0.5';
   try {
     const src = path.join(tmp, 'src.mp4');
-    ffmpeg(['-f', 'lavfi', '-i', 'testsrc2=size=960x480:rate=30:duration=4', '-pix_fmt', 'yuv420p', src]);
+    ffmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=960x480:rate=30:duration=4',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=4',
+      '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', src,
+    ]);
     const out = path.join(tmp, 'out.mp4');
     const width = 160;
     const height = 90;
     const fov = 90;
+    const lines = [];
     const rendered = await renderFromEdl(src, out, [
       { t: 0, camera: 1 },
       { t: 3, camera: 2, panSpeed: 24 },
@@ -84,17 +89,27 @@ test('a chunked yaw pan matches per-frame v360 and the joined frame count', { ti
       width,
       height,
       fov,
-      log: () => {},
+      log: (line) => lines.push(line),
     });
+    assert.ok(lines.some((line) => line.includes('160x90 yuv420p, 1.5× measured RSS')));
+    assert.ok(lines.some((line) => line.startsWith('concat ')));
+    assert.ok(lines.some((line) => line.startsWith('frame check ')));
+    assert.ok(lines.some((line) => line.startsWith('audio encode ')));
+    assert.ok(lines.some((line) => line.startsWith('mux copy + faststart ')));
     assert.ok(rendered.chunks > rendered.segments.length);
 
     const facts = JSON.parse(ffprobe([
       '-count_frames', '-select_streams', 'v:0',
-      '-show_entries', 'stream=nb_read_frames',
+      '-show_entries', 'stream=nb_read_frames,codec_name',
       '-show_entries', 'format=duration',
       '-of', 'json', out,
     ]));
     assert.equal(Number(facts.streams[0].nb_read_frames), 120);
+    const streams = JSON.parse(ffprobe([
+      '-show_entries', 'stream=codec_type,codec_name',
+      '-of', 'json', out,
+    ])).streams;
+    assert.ok(streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
     assert.ok(Math.abs(Number(facts.format.duration) - 4) < 1.5 / 30);
 
     const times = ffprobe([
