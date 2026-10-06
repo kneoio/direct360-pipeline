@@ -3,49 +3,69 @@
 # stderr, forwarded with progress_update so it shows up on GET /status while
 # the job is IN_PROGRESS. Other stderr lines are the worker logs.
 #
-# node runs in its own process group. Cancel, timeout (SIGTERM), and the
-# handler's finally kill that group so a warm worker does not keep ffmpeg.
+# node runs in its own process group. Cancel, timeout, and the handler's
+# finally kill that group (SIGTERM, then SIGKILL after 3s) so a warm worker
+# does not keep ffmpeg.
+import asyncio
 import json
 import os
 import signal
-import subprocess
 import sys
 import threading
-
-import runpod
+import time
 
 _proc = None
-_proc_lock = threading.Lock()
 
 
-def _kill_group(proc):
-    if proc is None or proc.poll() is not None:
+def _kill_group_sync(proc):
+    if proc is None or proc.returncode is not None:
         return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
+
+
+def _sigkill_later(pid):
+    time.sleep(3)
     try:
-        proc.wait(timeout=8)
-    except subprocess.TimeoutExpired:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+async def kill_group(proc):
+    """SIGTERM the process group, then SIGKILL if it is still alive after 3s."""
+    if proc is None or proc.returncode is not None:
+        return
+    pid = proc.pid
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    threading.Thread(target=_sigkill_later, args=(pid,), daemon=True).start()
+    try:
+        await asyncio.wait_for(asyncio.shield(proc.wait()), 3)
+    except asyncio.TimeoutError:
         try:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+    except asyncio.CancelledError:
+        raise
 
 
 def _on_signal(signum, _frame):
-    with _proc_lock:
-        proc = _proc
-    _kill_group(proc)
+    _kill_group_sync(_proc)
     raise SystemExit(128 + signum)
 
 
 def _job_cancelled(job):
+    import runpod
     for owner in (runpod.serverless, runpod):
         fn = getattr(owner, "is_job_cancelled", None)
         if callable(fn):
@@ -61,65 +81,95 @@ def _job_cancelled(job):
     return False
 
 
-def handler(job):
+async def run_grouped(argv, stdin_text, on_stderr_line):
+    """Run argv in a new session. Cancel and finally kill the whole group."""
     global _proc
-    proc = subprocess.Popen(
-        ["node", "/app/worker/render.js"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
-    with _proc_lock:
-        _proc = proc
-    stop = threading.Event()
+    _proc = proc
     try:
-        proc.stdin.write(json.dumps(job["input"]))
+        if stdin_text:
+            proc.stdin.write(stdin_text.encode())
         proc.stdin.close()
 
-        def read_stderr():
-            for line in proc.stderr:
-                text = line.rstrip("\n")
-                if text.startswith("PROGRESS "):
-                    try:
-                        runpod.serverless.progress_update(job, json.loads(text[len("PROGRESS "):]))
-                    except Exception as e:
-                        print(f"progress_update failed: {e}", file=sys.stderr, flush=True)
-                elif text:
-                    print(text, file=sys.stderr, flush=True)
-
-        def watch_cancel():
-            while not stop.wait(2):
-                if proc.poll() is not None:
+        async def pump():
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
                     return
-                if _job_cancelled(job):
-                    _kill_group(proc)
-                    return
+                on_stderr_line(line.decode(errors="replace"))
 
-        logs = threading.Thread(target=read_stderr, daemon=True)
-        logs.start()
-        watchdog = threading.Thread(target=watch_cancel, daemon=True)
-        watchdog.start()
-        stdout = proc.stdout.read()
-        code = proc.wait()
-        stop.set()
-        logs.join(timeout=5)
-        watchdog.join(timeout=1)
+        stderr_task = asyncio.create_task(pump())
+        try:
+            stdout = await proc.stdout.read()
+            code = await proc.wait()
+        finally:
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except asyncio.CancelledError:
+                pass
+        return code, stdout
+    finally:
+        await kill_group(proc)
+        if _proc is proc:
+            _proc = None
 
-        lines = stdout.strip().splitlines()
+
+async def handler(job):
+    def on_line(text):
+        line = text.rstrip("\n")
+        if line.startswith("PROGRESS "):
+            try:
+                import runpod
+                runpod.serverless.progress_update(job, json.loads(line[len("PROGRESS "):]))
+            except Exception as e:
+                print(f"progress_update failed: {e}", file=sys.stderr, flush=True)
+        elif line:
+            print(line, file=sys.stderr, flush=True)
+
+    async def watch_cancel():
+        while True:
+            await asyncio.sleep(2)
+            if _job_cancelled(job):
+                raise asyncio.CancelledError()
+
+    run_task = asyncio.create_task(run_grouped(
+        ["node", "/app/worker/render.js"],
+        json.dumps(job["input"]),
+        on_line,
+    ))
+    watch_task = asyncio.create_task(watch_cancel())
+    try:
+        done, _pending = await asyncio.wait(
+            {run_task, watch_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if watch_task in done and not run_task.done():
+            run_task.cancel()
+        code, stdout = await run_task
+        lines = stdout.decode(errors="replace").strip().splitlines()
         if not lines:
             return {"error": f"render.js exited {code} with no output"}
         return json.loads(lines[-1])
     finally:
-        stop.set()
-        _kill_group(proc)
-        with _proc_lock:
-            if _proc is proc:
-                _proc = None
+        watch_task.cancel()
+        if not run_task.done():
+            run_task.cancel()
+        await asyncio.gather(run_task, watch_task, return_exceptions=True)
 
 
-signal.signal(signal.SIGTERM, _on_signal)
-signal.signal(signal.SIGINT, _on_signal)
+def main():
+    import runpod
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
+    runpod.serverless.start({"handler": handler})
 
-runpod.serverless.start({"handler": handler})
+
+if __name__ == "__main__":
+    main()

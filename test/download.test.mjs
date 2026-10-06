@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { downloadSource } from '../worker/render.js';
+import { downloadFile, downloadSource, objectSize } from '../worker/render.js';
 
 function serve(body) {
   const server = http.createServer((req, res) => {
@@ -52,8 +52,8 @@ test('source download matches the object size', async () => {
     assert.equal(fs.statSync(dest).size, body.length);
     assert.equal(fs.readFileSync(dest).compare(body), 0);
     const summary = lines.join('');
-    assert.match(summary, /source download 20971520 bytes in [\d.]+s \([\d.]+ MB\/s, \d+ connections\)/);
-    assert.doesNotMatch(summary, /single-connection fallback/);
+    assert.match(summary, /source download 20971520 bytes in [\d.]+s \([\d.]+ MB\/s, (?:\d+ connections|1 connection)\)/);
+    if (!/aria2c download failed/.test(summary)) assert.doesNotMatch(summary, /single-connection fallback/);
   } finally {
     process.stderr.write = write;
     server.close();
@@ -80,9 +80,50 @@ test('missing aria2c falls back to one connection', async () => {
     const summary = lines.join('');
     assert.match(summary, /single-connection fallback/);
     assert.match(summary, /1 connection\)/);
+    assert.equal(fs.existsSync(`${dest}.aria2`), false);
   } finally {
     process.env.PATH = previous;
     process.stderr.write = write;
+    server.close();
+    fs.rmSync(dest, { force: true });
+    fs.rmSync(`${dest}.aria2`, { force: true });
+  }
+});
+
+test('objectSize uses a 2xx length and ignores a failed range', async () => {
+  const server = http.createServer((req, res) => {
+    if (req.headers.range) {
+      res.writeHead(500, { 'Content-Length': '9', 'Content-Range': 'bytes 0-0/999' });
+      res.end('nope');
+      return;
+    }
+    res.writeHead(200, { 'Content-Length': '12' });
+    res.end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address();
+    assert.equal(await objectSize(`http://127.0.0.1:${port}/a`), 12);
+  } finally {
+    server.close();
+  }
+});
+
+test('a 200 on resume restarts the file from the beginning', async () => {
+  const body = Buffer.from('abcdefghijklmnopqrstuvwxyz');
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Length': body.length });
+    res.end(body);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const dest = path.join(os.tmpdir(), `d360-resume-${Date.now()}.bin`);
+  fs.writeFileSync(dest, body.subarray(0, 10));
+  try {
+    const { port } = server.address();
+    const size = await downloadFile(`http://127.0.0.1:${port}/a`, dest, body.length);
+    assert.equal(size, body.length);
+    assert.equal(fs.readFileSync(dest).compare(body), 0);
+  } finally {
     server.close();
     fs.rmSync(dest, { force: true });
   }

@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { eacToEquirectFilter, stitchGopro, stitchPreset } from '../src/gopro.js';
+import { chunkMinSeconds, containerLimits, planChunks } from '../src/edl.js';
 import { buildMatrix } from '../src/matrix.js';
 
 test('stitch preset is medium unless D360_STITCH_PRESET names an x264 preset', () => {
@@ -59,7 +60,11 @@ test('chunked stitch keeps the source frame count and puts an IDR on every chunk
     const out = path.join(tmp, 'equirect.mp4');
     const lines = [];
     const stitched = await stitchGopro(src, out, { log: (line) => lines.push(line) });
-    assert.ok(stitched.chunks > 1, lines.join('\n'));
+    const planned = planChunks(
+      [{ type: 'hold', start: 0, dur: 0.6 }],
+      { totalFrames: 6, fps: 10, chunkSeconds: chunkMinSeconds(0.6, containerLimits().cpus) },
+    );
+    assert.equal(stitched.chunks, planned.length, lines.join('\n'));
     assert.equal(stitched.frames, 6);
     assert.equal(stitched.preset, 'ultrafast');
     const facts = JSON.parse(ffprobe([
@@ -81,9 +86,11 @@ test('chunked stitch keeps the source frame count and puts an IDR on every chunk
       '-show_entries', 'frame=key_frame',
       '-of', 'csv=p=0', out,
     ]).trim().split('\n').map((line) => line.split(',')[0]);
+    const keyAt = new Set(planned.map((chunk) => chunk.seekFrame));
     assert.equal(keys.length, 6);
-    assert.equal(keys[0], '1');
-    assert.ok(keys.includes('1', 1), `expected an IDR after the first frame, got ${keys.join(',')}`);
+    keys.forEach((flag, index) => {
+      if (keyAt.has(index)) assert.equal(flag, '1', `frame ${index} starts a chunk`);
+    });
     assert.ok(lines.some((line) => line.startsWith('peak concurrent ffmpeg:')));
   } finally {
     if (previous.preset == null) delete process.env.D360_STITCH_PRESET;
