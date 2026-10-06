@@ -95,7 +95,7 @@ test('a chunked yaw pan matches per-frame v360 and the joined frame count', { ti
     assert.ok(lines.some((line) => line.startsWith('concat ')));
     assert.ok(lines.some((line) => line.startsWith('frame check ')));
     assert.ok(lines.some((line) => line.startsWith('audio encode ')));
-    assert.ok(lines.some((line) => line.startsWith('mux copy + faststart ')));
+    assert.ok(lines.some((line) => line.startsWith('concat + faststart ')));
     assert.ok(rendered.chunks > rendered.segments.length);
 
     const facts = JSON.parse(ffprobe([
