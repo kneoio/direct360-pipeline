@@ -3,82 +3,71 @@
 # stderr, forwarded with progress_update so it shows up on GET /status while
 # the job is IN_PROGRESS. Other stderr lines are the worker logs.
 #
-# node runs in its own process group. Cancel, timeout, and the handler's
-# finally kill that group (SIGTERM, then SIGKILL after 3s) so a warm worker
-# does not keep ffmpeg.
+# node runs in its own process group. The handler's finally signals that
+# group even after node has exited (SIGTERM, then SIGKILL if the group is
+# still there after 3s) so a warm worker does not keep ffmpeg.
+# runpod 1.12 installs its own signal handlers and has no is_job_cancelled,
+# so this process does not watch for cancel itself.
 import asyncio
 import json
 import os
 import signal
 import sys
-import threading
-import time
 
 _proc = None
+# ffmpeg progress and aria2 lines can exceed the 64 KiB readline default.
+_STDERR_LIMIT = 1024 * 1024
 
 
-def _kill_group_sync(proc):
-    if proc is None or proc.returncode is not None:
-        return
+def _group_alive(pid):
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(pid, 0)
+        return True
     except ProcessLookupError:
-        return
+        return False
 
 
-def _sigkill_later(pid):
-    time.sleep(3)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+async def _wait_group_gone(proc):
+    """Reap the leader, then wait until killpg sees nobody left."""
+    if proc.returncode is None:
+        try:
+            await proc.wait()
+        except (ProcessLookupError, ChildProcessError):
+            pass
+    while _group_alive(proc.pid):
+        await asyncio.sleep(0.05)
 
 
 async def kill_group(proc):
-    """SIGTERM the process group, then SIGKILL if it is still alive after 3s."""
-    if proc is None or proc.returncode is not None:
+    """SIGTERM the process group, then SIGKILL if anyone is left after 3s.
+
+    The leader may already have exited. Grandchildren stay in the group, so
+    the signal is sent anyway.
+    """
+    if proc is None:
         return
     pid = proc.pid
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
-    threading.Thread(target=_sigkill_later, args=(pid,), daemon=True).start()
+        pass
     try:
-        await asyncio.wait_for(asyncio.shield(proc.wait()), 3)
+        await asyncio.wait_for(_wait_group_gone(proc), 3)
     except asyncio.TimeoutError:
         try:
             os.killpg(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        try:
+            await asyncio.wait_for(_wait_group_gone(proc), 1)
+        except asyncio.TimeoutError:
+            pass
     except asyncio.CancelledError:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         raise
-
-
-def _on_signal(signum, _frame):
-    _kill_group_sync(_proc)
-    raise SystemExit(128 + signum)
-
-
-def _job_cancelled(job):
-    import runpod
-    for owner in (runpod.serverless, runpod):
-        fn = getattr(owner, "is_job_cancelled", None)
-        if callable(fn):
-            try:
-                return bool(fn(job))
-            except TypeError:
-                try:
-                    return bool(fn())
-                except Exception:
-                    return False
-            except Exception:
-                return False
-    return False
 
 
 async def run_grouped(argv, stdin_text, on_stderr_line):
@@ -90,8 +79,11 @@ async def run_grouped(argv, stdin_text, on_stderr_line):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        limit=_STDERR_LIMIT,
     )
     _proc = proc
+    stdout = b''
+    stderr_task = None
     try:
         if stdin_text:
             proc.stdin.write(stdin_text.encode())
@@ -99,26 +91,33 @@ async def run_grouped(argv, stdin_text, on_stderr_line):
 
         async def pump():
             while True:
-                line = await proc.stderr.readline()
+                try:
+                    line = await proc.stderr.readline()
+                except asyncio.LimitOverrunError as overrun:
+                    # The separator was not in the buffer. Drain it and keep going.
+                    chunk = await proc.stderr.read(max(1, overrun.consumed))
+                    if not chunk:
+                        return
+                    on_stderr_line(chunk.decode(errors="replace"))
+                    continue
                 if not line:
                     return
                 on_stderr_line(line.decode(errors="replace"))
 
         stderr_task = asyncio.create_task(pump())
-        try:
-            stdout = await proc.stdout.read()
-            code = await proc.wait()
-        finally:
+        stdout = await proc.stdout.read()
+    finally:
+        if stderr_task is not None:
             stderr_task.cancel()
             try:
                 await stderr_task
             except asyncio.CancelledError:
                 pass
-        return code, stdout
-    finally:
+        # Signal before the leader is reaped so the group id is still ours.
         await kill_group(proc)
         if _proc is proc:
             _proc = None
+    return proc.returncode, stdout
 
 
 async def handler(job):
@@ -133,41 +132,19 @@ async def handler(job):
         elif line:
             print(line, file=sys.stderr, flush=True)
 
-    async def watch_cancel():
-        while True:
-            await asyncio.sleep(2)
-            if _job_cancelled(job):
-                raise asyncio.CancelledError()
-
-    run_task = asyncio.create_task(run_grouped(
+    code, stdout = await run_grouped(
         ["node", "/app/worker/render.js"],
         json.dumps(job["input"]),
         on_line,
-    ))
-    watch_task = asyncio.create_task(watch_cancel())
-    try:
-        done, _pending = await asyncio.wait(
-            {run_task, watch_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if watch_task in done and not run_task.done():
-            run_task.cancel()
-        code, stdout = await run_task
-        lines = stdout.decode(errors="replace").strip().splitlines()
-        if not lines:
-            return {"error": f"render.js exited {code} with no output"}
-        return json.loads(lines[-1])
-    finally:
-        watch_task.cancel()
-        if not run_task.done():
-            run_task.cancel()
-        await asyncio.gather(run_task, watch_task, return_exceptions=True)
+    )
+    lines = stdout.decode(errors="replace").strip().splitlines()
+    if not lines:
+        return {"error": f"render.js exited {code} with no output"}
+    return json.loads(lines[-1])
 
 
 def main():
     import runpod
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
     runpod.serverless.start({"handler": handler})
 
 

@@ -13,7 +13,7 @@ RUN make
 
 FROM node:20-bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates aria2 \
+ && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates aria2 tini \
  && pip3 install --no-cache-dir --break-system-packages 'runpod==1.12.0' \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=gpmf /src/gpmf2json /usr/local/bin/gpmf2json
@@ -26,4 +26,6 @@ COPY package.json ./
 COPY src ./src
 COPY lib ./lib
 COPY worker ./worker
+# tini reaps grandchildren ffmpeg leaves behind when the job is killed.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "-u", "/app/worker/handler.py"]

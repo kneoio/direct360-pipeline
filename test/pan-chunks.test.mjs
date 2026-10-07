@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fieldOfView } from '../src/formats.js';
-import { chunkMinSeconds, panPose, planChunks, planSegments, renderFromEdl } from '../src/edl.js';
+import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl } from '../src/edl.js';
 
 test('chunk length is at least the minimum and otherwise the clip over two waves of cores', () => {
   assert.equal(chunkMinSeconds(110, 16, {}), 4);
@@ -118,7 +118,26 @@ test('a chunked yaw pan matches per-frame v360 and the joined frame count', { ti
       '-of', 'csv=p=0', out,
     ]).trim().split('\n');
     const keys = times.map((line, index) => (line.startsWith('1,') ? index : -1)).filter((index) => index >= 0);
-    assert.deepEqual(keys, [0, 15, 30, 45, 60, 75, 90, 105]);
+    const srcInfo = JSON.parse(ffprobe([
+      '-show_entries', 'format=duration',
+      '-show_entries', 'stream=codec_type,avg_frame_rate,nb_frames,duration',
+      '-of', 'json', src,
+    ]));
+    const video = srcInfo.streams.find((stream) => stream.codec_type === 'video');
+    const [num, den] = String(video.avg_frame_rate).split('/').map(Number);
+    const fps = num / den;
+    const duration = Number(video.duration) || Number(srcInfo.format.duration);
+    const totalFrames = Number(video.nb_frames) || Math.round(duration * fps);
+    const planned = planChunks(
+      planSegments(
+        [{ t: 0, camera: 1 }, { t: 3, camera: 2, panSpeed: 24 }],
+        [0, 24],
+        [0, 0],
+        duration,
+      ),
+      { totalFrames, fps, chunkSeconds: chunkMinSeconds(duration, containerLimits().cpus) },
+    );
+    assert.deepEqual(keys, planned.map((chunk) => chunk.seekFrame));
     const pts = times.map((line) => Number(line.split(',')[1]));
     for (let i = 1; i < pts.length; i++) {
       const step = pts[i] - pts[i - 1];

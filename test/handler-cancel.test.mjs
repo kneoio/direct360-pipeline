@@ -12,7 +12,7 @@ test('a cancelled job leaves no child from the process group', async () => {
   const pidfile = path.join(os.tmpdir(), `d360-handler-${process.pid}.pid`);
   fs.rmSync(pidfile, { force: true });
   const script = `
-import asyncio, os, sys
+import asyncio, os, sys, time
 sys.path.insert(0, ${JSON.stringify(worker)})
 import handler
 
@@ -44,8 +44,26 @@ async def main():
         await task
     except asyncio.CancelledError:
         pass
-    await asyncio.sleep(0.3)
-    print("dead" if not os.path.exists(f"/proc/{pid}") else "alive")
+
+    def gone(check):
+        path = f"/proc/{check}/stat"
+        try:
+            text = open(path).read()
+        except FileNotFoundError:
+            return True
+        # state follows the comm field, which may itself contain spaces and parens
+        state = text.rsplit(")", 1)[-1].split()[0]
+        return state == "Z"
+
+    deadline = time.monotonic() + 2
+    while True:
+        if gone(pid):
+            print("dead")
+            break
+        if time.monotonic() >= deadline:
+            print("alive")
+            break
+        await asyncio.sleep(0.1)
 
 asyncio.run(main())
 `;
@@ -63,7 +81,11 @@ asyncio.run(main())
     assert.match(result.out, /dead/);
     if (fs.existsSync(pidfile)) {
       const pid = Number(fs.readFileSync(pidfile, 'utf8'));
-      assert.equal(fs.existsSync(`/proc/${pid}`), false);
+      const stat = `/proc/${pid}/stat`;
+      if (fs.existsSync(stat)) {
+        const state = fs.readFileSync(stat, 'utf8').split(')').pop().trim().split(/\s+/)[0];
+        assert.equal(state, 'Z');
+      }
     }
   } finally {
     fs.rmSync(pidfile, { force: true });
