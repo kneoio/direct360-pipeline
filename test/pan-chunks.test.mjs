@@ -216,3 +216,130 @@ test('a chunked yaw pan matches per-frame v360 and the joined frame count', { ti
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('a pitch pan across camera rows keeps frame count, border continuity, and stays near yaw-pan time', { timeout: 120000 }, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-pitch-'));
+  const previous = {
+    preset: process.env.D360_RENDER_PRESET,
+    crf: process.env.D360_RENDER_CRF,
+    chunk: process.env.D360_CHUNK_MIN_SEC,
+  };
+  process.env.D360_RENDER_PRESET = 'ultrafast';
+  process.env.D360_RENDER_CRF = '10';
+  process.env.D360_CHUNK_MIN_SEC = '0.5';
+  try {
+    const src = path.join(tmp, 'src.mp4');
+    ffmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=960x480:rate=30:duration=4',
+      '-pix_fmt', 'yuv420p', '-an', src,
+    ]);
+    const width = 320;
+    const height = 180;
+    const fov = 90;
+    // Top row and bottom row. Speeds are set so both pans last two seconds
+    // and land in the same 0.5s chunks.
+    const yaws = [0, 24];
+    const pitches = [-18, 22];
+    const yawDistance = 24;
+    const pitchDistance = Math.hypot(24, 22 - (-18));
+    const yawEdl = [{ t: 0, camera: 1 }, { t: 3, camera: 2, panSpeed: yawDistance / 2 }];
+    const pitchEdl = [{ t: 0, camera: 1 }, { t: 3, camera: 2, panSpeed: pitchDistance / 2 }];
+    const yawLines = [];
+    const pitchLines = [];
+    const started = Date.now();
+    await renderFromEdl(src, path.join(tmp, 'yaw.mp4'), yawEdl, {
+      format: 'youtube', yaws, pitches: [0, 0], width, height, fov,
+      log: (line) => yawLines.push(line),
+    });
+    const yawMs = Date.now() - started;
+    const pitchStarted = Date.now();
+    const rendered = await renderFromEdl(src, path.join(tmp, 'pitch.mp4'), pitchEdl, {
+      format: 'youtube', yaws, pitches, width, height, fov,
+      log: (line) => pitchLines.push(line),
+    });
+    const pitchMs = Date.now() - pitchStarted;
+    assert.ok(pitchLines.some((line) => line.startsWith('pitch-pan per process ')));
+    assert.equal(rendered.chunks > rendered.segments.length, true);
+
+    const out = path.join(tmp, 'pitch.mp4');
+    const facts = JSON.parse(ffprobe([
+      '-count_frames', '-select_streams', 'v:0',
+      '-show_entries', 'stream=nb_read_frames',
+      '-show_entries', 'format=duration',
+      '-of', 'json', out,
+    ]));
+    assert.equal(Number(facts.streams[0].nb_read_frames), 120);
+    assert.ok(Math.abs(Number(facts.format.duration) - 4) < 1.5 / 30);
+
+    const times = ffprobe([
+      '-select_streams', 'v:0',
+      '-show_entries', 'frame=key_frame,best_effort_timestamp_time',
+      '-of', 'csv=p=0', out,
+    ]).trim().split('\n');
+    const keys = times.map((line, index) => (line.startsWith('1,') ? index : -1)).filter((index) => index >= 0);
+    const srcInfo = JSON.parse(ffprobe([
+      '-show_entries', 'format=duration',
+      '-show_entries', 'stream=codec_type,avg_frame_rate,nb_frames,duration',
+      '-of', 'json', src,
+    ]));
+    const video = srcInfo.streams.find((stream) => stream.codec_type === 'video');
+    const [num, den] = String(video.avg_frame_rate).split('/').map(Number);
+    const fps = num / den;
+    const duration = Number(video.duration) || Number(srcInfo.format.duration);
+    const totalFrames = Number(video.nb_frames) || Math.round(duration * fps);
+    const planned = planChunks(
+      planSegments(pitchEdl, yaws, pitches, duration),
+      { totalFrames, fps, chunkSeconds: chunkMinSeconds(duration, containerLimits().cpus) },
+    );
+    assert.deepEqual(keys, planned.map((chunk) => chunk.seekFrame));
+    const pts = times.map((line) => Number(line.split(',')[1]));
+    for (let i = 1; i < pts.length; i++) {
+      const step = pts[i] - pts[i - 1];
+      assert.ok(step > 0.02 && step < 0.05, `frame ${i} step ${step}`);
+    }
+    const panChunks = planned.filter((chunk) => chunk.type === 'pan');
+    assert.ok(panChunks.length >= 2);
+    assert.equal(panChunks.every((chunk) => chunk.yawOnly), false);
+    const border = panChunks[1].seekFrame;
+    const { hfov, vfov } = fieldOfView(width, height, fov);
+    const pan = planned.find((chunk) => chunk.type === 'pan');
+    const samples = [
+      [pan.seekFrame, pan.index0, 'start'],
+      [border, panChunks[1].index0, 'border'],
+      [panChunks.at(-1).seekFrame + panChunks.at(-1).frames - 1, panChunks.at(-1).index0 + panChunks.at(-1).frames - 1, 'end'],
+    ];
+    for (const [absolute, local, label] of samples) {
+      const pose = panPose(pan.fromYaw, pan.toYaw, pan.fromPitch, pan.toPitch, local, pan.panFrames);
+      const ref = path.join(tmp, `ref-${label}.png`);
+      const got = path.join(tmp, `got-${label}.png`);
+      const filter = `v360=input=e:output=flat:yaw=${pose.yaw.toFixed(3)}:pitch=${pose.pitch.toFixed(3)}:roll=0:h_fov=${hfov}:v_fov=${vfov}:w=${width}:h=${height}`;
+      ffmpeg(['-i', src, '-vf', `select=eq(n\\,${absolute}),${filter}`, '-frames:v', '1', ref]);
+      ffmpeg(['-i', out, '-vf', `select=eq(n\\,${absolute})`, '-frames:v', '1', got]);
+      const psnr = spawnSync('ffmpeg', ['-hide_banner', '-i', ref, '-i', got, '-lavfi', 'psnr', '-f', 'null', '-'], { encoding: 'utf8' });
+      const ssim = spawnSync('ffmpeg', ['-hide_banner', '-i', ref, '-i', got, '-lavfi', 'ssim', '-f', 'null', '-'], { encoding: 'utf8' });
+      const psnrValue = Number((psnr.stderr.match(/average:([\d.]+|inf)/) || [])[1]);
+      const ssimValue = Number((ssim.stderr.match(/All:([\d.]+)/) || [])[1]);
+      assert.ok(psnrValue >= 28, `${label} PSNR ${psnrValue}`);
+      assert.ok(ssimValue >= 0.9, `${label} SSIM ${ssimValue}`);
+    }
+
+    const secondsOf = (lines, kind) => lines
+      .filter((line) => line.includes(kind))
+      .map((line) => Number((line.match(/in ([\d.]+)s/) || [])[1]))
+      .filter((n) => Number.isFinite(n));
+    const yawChunk = Math.max(...secondsOf(yawLines, 'pan yaw'));
+    const pitchChunk = Math.max(...secondsOf(pitchLines, 'pan pitch'));
+    assert.ok(yawChunk > 0 && pitchChunk > 0, `yaw ${yawChunk} pitch ${pitchChunk}`);
+    assert.ok(pitchChunk <= yawChunk * 2, `pitch chunk ${pitchChunk}s vs yaw chunk ${yawChunk}s (totals ${pitchMs}ms / ${yawMs}ms)`);
+  } finally {
+    for (const [key, value] of Object.entries({
+      D360_RENDER_PRESET: previous.preset,
+      D360_RENDER_CRF: previous.crf,
+      D360_CHUNK_MIN_SEC: previous.chunk,
+    })) {
+      if (value == null) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
