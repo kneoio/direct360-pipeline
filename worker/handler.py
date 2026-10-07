@@ -92,10 +92,21 @@ async def run_grouped(argv, stdin_text, on_stderr_line):
         async def pump():
             while True:
                 try:
-                    line = await proc.stderr.readline()
+                    # readuntil leaves an over-long buffer in place. readline()
+                    # turns that into ValueError and drops the bytes.
+                    line = await proc.stderr.readuntil(b"\n")
+                except asyncio.IncompleteReadError as partial:
+                    if partial.partial:
+                        on_stderr_line(partial.partial.decode(errors="replace"))
+                    return
                 except asyncio.LimitOverrunError as overrun:
-                    # The separator was not in the buffer. Drain it and keep going.
                     chunk = await proc.stderr.read(max(1, overrun.consumed))
+                    if not chunk:
+                        return
+                    on_stderr_line(chunk.decode(errors="replace"))
+                    continue
+                except ValueError:
+                    chunk = await proc.stderr.read(64 * 1024)
                     if not chunk:
                         return
                     on_stderr_line(chunk.decode(errors="replace"))
@@ -107,16 +118,23 @@ async def run_grouped(argv, stdin_text, on_stderr_line):
         stderr_task = asyncio.create_task(pump())
         stdout = await proc.stdout.read()
     finally:
-        if stderr_task is not None:
-            stderr_task.cancel()
+        try:
+            if stderr_task is not None:
+                stderr_task.cancel()
+                try:
+                    await stderr_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    print(f"stderr pump failed: {exc}", file=sys.stderr, flush=True)
+        finally:
+            # A pump error must not skip this. Signal before the leader is
+            # reaped so the group id is still ours.
             try:
-                await stderr_task
-            except asyncio.CancelledError:
-                pass
-        # Signal before the leader is reaped so the group id is still ours.
-        await kill_group(proc)
-        if _proc is proc:
-            _proc = None
+                await kill_group(proc)
+            finally:
+                if _proc is proc:
+                    _proc = None
     return proc.returncode, stdout
 
 
