@@ -230,7 +230,7 @@ test('a pitch pan across camera rows keeps frame count, border continuity, and s
   try {
     const src = path.join(tmp, 'src.mp4');
     ffmpeg([
-      '-f', 'lavfi', '-i', 'testsrc2=size=960x480:rate=30:duration=4',
+      '-f', 'lavfi', '-i', 'testsrc2=size=1920x960:rate=30:duration=4',
       '-pix_fmt', 'yuv420p', '-an', src,
     ]);
     const width = 320;
