@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
-  aria2Completed, cachedSource, downloadFile, downloadSource, downloadWatchdog, fetchSource, objectSize,
+  aria2Completed, cachedSource, downloadFile, downloadSource, downloadWatchdog, fetchSource, objectSize, tailBytes,
 } from '../worker/render.js';
 
 const hasAria2 = spawnSync('aria2c', ['--version']).status === 0;
@@ -140,10 +140,15 @@ test('aria2c summary lines give the completed bytes', () => {
   assert.equal(aria2Completed('FILE: ./out.bin'), null);
 });
 
-test('downloads default to 16 connections and a 2 MB/s / 20 s watchdog with 2 restarts', () => {
-  assert.deepEqual(downloadWatchdog({}), { minBytesPerSec: 2e6, windowMs: 20_000, restarts: 2 });
-  assert.deepEqual(downloadWatchdog({ D360_DOWNLOAD_MIN_MBPS: '5', D360_DOWNLOAD_STALL_SEC: '10', D360_DOWNLOAD_RESTARTS: '1' }),
-    { minBytesPerSec: 5e6, windowMs: 10_000, restarts: 1 });
+test('the watchdog defaults to a 45 s no-bytes stall window with 2 restarts', () => {
+  assert.deepEqual(downloadWatchdog({}), { windowMs: 45_000, restarts: 2 });
+  assert.deepEqual(downloadWatchdog({ D360_DOWNLOAD_STALL_SEC: '10', D360_DOWNLOAD_RESTARTS: '1' }),
+    { windowMs: 10_000, restarts: 1 });
+});
+
+test('the tail is 5% of the object or 32 MB, whichever is larger', () => {
+  assert.equal(tailBytes(185.6e6), 32 * 1024 * 1024);
+  assert.equal(tailBytes(2e9), 2e9 * 0.05);
 });
 
 /** Serves `size` bytes at roughly `bytesPerSec`, with Range. Counts GETs that send body bytes. */
@@ -176,9 +181,46 @@ function slowServer(size, bytesPerSec) {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, stats })));
 }
 
-test('the watchdog restarts a slow aria2c run and fails after the last restart', { skip: !hasAria2 && 'aria2c not installed' }, async () => {
-  const { server } = await slowServer(64 * 1024 * 1024, 200 * 1024);
-  const dest = path.join(os.tmpdir(), `d360-stall-${Date.now()}.bin`);
+/**
+ * Range server with per-byte-offset pacing. `rate(offset)` is bytes/s for the
+ * bytes starting at `offset` (per connection). `hold()` true pauses every body
+ * (no bytes at all). `hangRanged` hangs aria2c's bodies, so only the
+ * single-connection fallback GET gets data.
+ */
+function pacedServer(size, { rate = () => 50e6, hold = () => false, hangRanged = false } = {}) {
+  const server = http.createServer((req, res) => {
+    const m = /bytes=(\d*)-(\d*)/.exec(req.headers.range || '');
+    const start = m && m[1] ? Number(m[1]) : 0;
+    const end = m && m[2] ? Number(m[2]) : size - 1;
+    res.writeHead(m ? 206 : 200, {
+      'Content-Length': end - start + 1,
+      'Content-Range': `bytes ${start}-${end}/${size}`,
+      'Accept-Ranges': 'bytes',
+      ETag: '"v1"',
+    });
+    if (end === start) {
+      res.end(Buffer.alloc(1, 1));
+      return;
+    }
+    const hung = hangRanged && /aria2/i.test(req.headers['user-agent'] || '');
+    let at = start;
+    const timer = setInterval(() => {
+      if (hung || hold()) return;
+      const n = Math.min(end + 1 - at, Math.max(1, Math.round(rate(at) / 20)));
+      res.write(Buffer.alloc(n, 1));
+      at += n;
+      if (at > end) {
+        clearInterval(timer);
+        res.end();
+      }
+    }, 50);
+    res.on('close', () => clearInterval(timer));
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
+}
+
+async function withDownload(server, body) {
+  const dest = path.join(os.tmpdir(), `d360-wd-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.bin`);
   const lines = [];
   const write = process.stderr.write;
   process.stderr.write = (chunk, ...rest) => {
@@ -187,16 +229,7 @@ test('the watchdog restarts a slow aria2c run and fails after the last restart',
   };
   try {
     const { port } = server.address();
-    const watch = { minBytesPerSec: 2e6, windowMs: 2_500, restarts: 2, tickMs: 250 };
-    await assert.rejects(fetchSource(`http://127.0.0.1:${port}/clip.bin`, dest, { watch }), (e) => {
-      assert.equal(e.code, 'DOWNLOAD_STALLED');
-      assert.match(e.message, /stalled \(below 2\.0 MB\/s for 3s at [\d.]+ MB\) after 2 restarts/);
-      return true;
-    });
-    const text = lines.join('');
-    assert.match(text, /restarting aria2c \(1\/2\)/);
-    assert.match(text, /restarting aria2c \(2\/2\)/);
-    assert.doesNotMatch(text, /single-connection fallback/);
+    await body(`http://127.0.0.1:${port}/clip.bin`, dest, () => lines.join(''));
   } finally {
     process.stderr.write = write;
     server.closeAllConnections?.();
@@ -204,6 +237,52 @@ test('the watchdog restarts a slow aria2c run and fails after the last restart',
     fs.rmSync(dest, { force: true });
     fs.rmSync(`${dest}.aria2`, { force: true });
   }
+}
+
+test('a slow tail (last 5 MB at 0.3 MB/s) completes without a restart', { skip: !hasAria2 && 'aria2c not installed', timeout: 90_000 }, async () => {
+  const size = 40 * 1024 * 1024;
+  const server = await pacedServer(size, { rate: (at) => (at >= size - 5 * 1024 * 1024 ? 0.3e6 : 50e6) });
+  await withDownload(server, async (url, dest, out) => {
+    // Average is far under any old MB/s floor, but bytes keep arriving.
+    const watch = { windowMs: 3_000, restarts: 2, tickMs: 250 };
+    const stats = await fetchSource(url, dest, { watch });
+    assert.equal(stats.bytes, size);
+    assert.equal(stats.restarts, 0);
+    assert.equal(stats.fallback, false);
+    assert.equal(stats.tailSlow, true);
+    assert.doesNotMatch(out(), /restarting aria2c/);
+    assert.match(out(), /slow tail/);
+  });
+});
+
+test('a full stall (no bytes for the window) restarts aria2c and then completes', { skip: !hasAria2 && 'aria2c not installed', timeout: 60_000 }, async () => {
+  const size = 24 * 1024 * 1024;
+  const until = Date.now() + 4_000;
+  const server = await pacedServer(size, { rate: () => 20e6, hold: () => Date.now() < until });
+  await withDownload(server, async (url, dest, out) => {
+    const watch = { windowMs: 2_000, restarts: 3, tickMs: 250 };
+    const stats = await fetchSource(url, dest, { watch });
+    assert.equal(stats.bytes, size);
+    assert.ok(stats.restarts >= 1);
+    assert.equal(stats.fallback, false);
+    assert.match(out(), /no new bytes for 2s .*restarting aria2c \(1\/3\)/);
+  });
+});
+
+test('restarts exhausted falls back to the single-connection GET and completes', { skip: !hasAria2 && 'aria2c not installed', timeout: 60_000 }, async () => {
+  const size = 12 * 1024 * 1024;
+  const server = await pacedServer(size, { rate: () => 50e6, hangRanged: true });
+  await withDownload(server, async (url, dest, out) => {
+    const watch = { windowMs: 1_500, restarts: 1, tickMs: 250 };
+    const stats = await fetchSource(url, dest, { watch });
+    assert.equal(stats.bytes, size);
+    assert.equal(stats.connections, 1);
+    assert.equal(stats.restarts, 1);
+    assert.equal(stats.fallback, true);
+    assert.match(out(), /restarting aria2c \(1\/1\)/);
+    assert.match(out(), /stalled .* after 1 restart; single-connection fallback/);
+    assert.equal(fs.statSync(dest).size, size);
+  });
 });
 
 test('a fast aria2c download passes the watchdog and reports MB/s', { skip: !hasAria2 && 'aria2c not installed' }, async () => {
@@ -212,7 +291,7 @@ test('a fast aria2c download passes the watchdog and reports MB/s', { skip: !has
   const dest = path.join(os.tmpdir(), `d360-fast-${Date.now()}.bin`);
   try {
     const { port } = server.address();
-    const stats = await fetchSource(`http://127.0.0.1:${port}/clip.bin`, dest, { watch: { minBytesPerSec: 2e6, windowMs: 2_000, restarts: 0, tickMs: 100 } });
+    const stats = await fetchSource(`http://127.0.0.1:${port}/clip.bin`, dest, { watch: { windowMs: 2_000, restarts: 0, tickMs: 100 } });
     assert.equal(stats.bytes, body.length);
     assert.equal(stats.restarts, 0);
     assert.equal(stats.connections, 16);
