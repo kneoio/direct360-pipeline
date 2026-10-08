@@ -4,7 +4,12 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { downloadFile, downloadSource, objectSize } from '../worker/render.js';
+import { spawnSync } from 'node:child_process';
+import {
+  aria2Completed, cachedSource, downloadFile, downloadSource, downloadWatchdog, fetchSource, objectSize,
+} from '../worker/render.js';
+
+const hasAria2 = spawnSync('aria2c', ['--version']).status === 0;
 
 function serve(body) {
   const server = http.createServer((req, res) => {
@@ -126,5 +131,131 @@ test('a 200 on resume restarts the file from the beginning', async () => {
   } finally {
     server.close();
     fs.rmSync(dest, { force: true });
+  }
+});
+
+test('aria2c summary lines give the completed bytes', () => {
+  assert.equal(aria2Completed('[#2967b7 4.5MiB/8.0MiB(57%) CN:4 DL:4.8MiB]'), 4.5 * 1024 ** 2);
+  assert.equal(aria2Completed('[#a 0B/0B CN:1 DL:0B]\n[#a 12KiB/1.0GiB(0%) CN:16 DL:3KiB]'), 12 * 1024);
+  assert.equal(aria2Completed('FILE: ./out.bin'), null);
+});
+
+test('downloads default to 16 connections and a 2 MB/s / 20 s watchdog with 2 restarts', () => {
+  assert.deepEqual(downloadWatchdog({}), { minBytesPerSec: 2e6, windowMs: 20_000, restarts: 2 });
+  assert.deepEqual(downloadWatchdog({ D360_DOWNLOAD_MIN_MBPS: '5', D360_DOWNLOAD_STALL_SEC: '10', D360_DOWNLOAD_RESTARTS: '1' }),
+    { minBytesPerSec: 5e6, windowMs: 10_000, restarts: 1 });
+});
+
+/** Serves `size` bytes at roughly `bytesPerSec`, with Range. Counts GETs that send body bytes. */
+function slowServer(size, bytesPerSec) {
+  const stats = { bodies: 0 };
+  const server = http.createServer((req, res) => {
+    const m = /bytes=(\d*)-(\d*)/.exec(req.headers.range || '');
+    const start = m && m[1] ? Number(m[1]) : 0;
+    const end = m && m[2] ? Number(m[2]) : size - 1;
+    res.writeHead(m ? 206 : 200, {
+      'Content-Length': end - start + 1,
+      'Content-Range': `bytes ${start}-${end}/${size}`,
+      'Accept-Ranges': 'bytes',
+      ETag: '"v1"',
+    });
+    if (end - start + 1 > 1) stats.bodies++;
+    let left = end - start + 1;
+    const step = Math.max(1, Math.round(bytesPerSec / 20));
+    const timer = setInterval(() => {
+      const n = Math.min(left, step);
+      res.write(Buffer.alloc(n, 1));
+      left -= n;
+      if (!left) {
+        clearInterval(timer);
+        res.end();
+      }
+    }, 50);
+    res.on('close', () => clearInterval(timer));
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, stats })));
+}
+
+test('the watchdog restarts a slow aria2c run and fails after the last restart', { skip: !hasAria2 && 'aria2c not installed' }, async () => {
+  const { server } = await slowServer(64 * 1024 * 1024, 200 * 1024);
+  const dest = path.join(os.tmpdir(), `d360-stall-${Date.now()}.bin`);
+  const lines = [];
+  const write = process.stderr.write;
+  process.stderr.write = (chunk, ...rest) => {
+    lines.push(String(chunk));
+    return write.call(process.stderr, chunk, ...rest);
+  };
+  try {
+    const { port } = server.address();
+    const watch = { minBytesPerSec: 2e6, windowMs: 2_500, restarts: 2, tickMs: 250 };
+    await assert.rejects(fetchSource(`http://127.0.0.1:${port}/clip.bin`, dest, { watch }), (e) => {
+      assert.equal(e.code, 'DOWNLOAD_STALLED');
+      assert.match(e.message, /stalled \(below 2\.0 MB\/s for 3s at [\d.]+ MB\) after 2 restarts/);
+      return true;
+    });
+    const text = lines.join('');
+    assert.match(text, /restarting aria2c \(1\/2\)/);
+    assert.match(text, /restarting aria2c \(2\/2\)/);
+    assert.doesNotMatch(text, /single-connection fallback/);
+  } finally {
+    process.stderr.write = write;
+    server.closeAllConnections?.();
+    server.close();
+    fs.rmSync(dest, { force: true });
+    fs.rmSync(`${dest}.aria2`, { force: true });
+  }
+});
+
+test('a fast aria2c download passes the watchdog and reports MB/s', { skip: !hasAria2 && 'aria2c not installed' }, async () => {
+  const body = Buffer.alloc(24 * 1024 * 1024, 5);
+  const server = await serve(body);
+  const dest = path.join(os.tmpdir(), `d360-fast-${Date.now()}.bin`);
+  try {
+    const { port } = server.address();
+    const stats = await fetchSource(`http://127.0.0.1:${port}/clip.bin`, dest, { watch: { minBytesPerSec: 2e6, windowMs: 2_000, restarts: 0, tickMs: 100 } });
+    assert.equal(stats.bytes, body.length);
+    assert.equal(stats.restarts, 0);
+    assert.equal(stats.connections, 16);
+    assert.ok(stats.mbps > 0);
+    assert.equal(fs.readFileSync(dest).compare(body), 0);
+  } finally {
+    server.close();
+    fs.rmSync(dest, { force: true });
+  }
+});
+
+test('a part input is downloaded once per worker and reused by the next part', async () => {
+  const { server, stats } = await slowServer(3 * 1024 * 1024, 50 * 1024 * 1024);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-cache-'));
+  fs.writeFileSync(path.join(dir, 'stale-other-source.mp4'), 'old');
+  try {
+    const { port } = server.address();
+    const url = `http://127.0.0.1:${port}/footage/source.mp4?X-Amz-Signature=a`;
+    const first = await cachedSource(url, { dir });
+    // A second job while the first still holds the cache downloads on its own.
+    const fallback = path.join(dir, '..', `d360-cache-fallback-${Date.now()}.mp4`);
+    const busy = await cachedSource(url, { dir, fallback: fallback });
+    assert.equal(busy.path, fallback);
+    fs.rmSync(fallback, { force: true });
+    first.release();
+    assert.equal(first.download.cached, false);
+    assert.equal(first.download.bytes, 3 * 1024 * 1024);
+    assert.equal(fs.existsSync(path.join(dir, 'stale-other-source.mp4')), false);
+    const bodies = stats.bodies;
+    // Another presigned URL for the same object: same file.
+    const second = await cachedSource(`http://127.0.0.1:${port}/footage/source.mp4?X-Amz-Signature=b`, { dir });
+    assert.equal(second.download.cached, true);
+    assert.equal(second.path, first.path);
+    assert.equal(stats.bodies, bodies);
+    second.release();
+    const other = await cachedSource(`http://127.0.0.1:${port}/footage/other.mp4`, { dir });
+    assert.equal(other.download.cached, false);
+    assert.notEqual(other.path, first.path);
+    assert.equal(fs.existsSync(first.path), false);
+    other.release();
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
