@@ -26,6 +26,9 @@ COPY package.json ./
 COPY src ./src
 COPY lib ./lib
 COPY worker ./worker
+# Shown as the worker's commit in logs and stats; the version itself is a hash of the files.
+ARG GIT_SHA=
+ENV D360_WORKER_VERSION=$GIT_SHA
 # tini reaps grandchildren ffmpeg leaves behind when the job is killed.
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["python3", "-u", "/app/worker/handler.py"]
