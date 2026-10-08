@@ -54,7 +54,9 @@ test('miss downloads into the volume, hit reuses it and reports both', async () 
   try {
     const url = `http://127.0.0.1:${server.address().port}/footage/a.mp4?sig=1`;
     const first = await cachedSource(url, { volume });
-    assert.equal(first.download.cache, 'miss');
+    assert.equal(first.download.cache.hit, false);
+    assert.equal(first.download.cache.volume, true);
+    assert.equal(first.download.cache.bytes, 2 * 1024 * 1024);
     assert.equal(first.download.cached, false);
     assert.equal(first.download.bytes, 2 * 1024 * 1024);
     assert.ok(first.path.startsWith(volume));
@@ -62,13 +64,14 @@ test('miss downloads into the volume, hit reuses it and reports both', async () 
     first.release();
     const bodies = stats.bodies;
     const second = await cachedSource(url.replace('sig=1', 'sig=2'), { volume });
-    assert.equal(second.download.cache, 'hit');
+    assert.equal(second.download.cache.hit, true);
+    assert.equal(second.download.cache.waitedMs, 0);
     assert.equal(second.download.cached, true);
     assert.equal(second.path, first.path);
     assert.equal(stats.bodies, bodies);
     const report = jobStats(tmp()).report(second.download);
-    assert.equal(report.cache, 'hit');
-    assert.equal(jobStats(tmp()).report(first.download).cache, 'miss');
+    assert.equal(report.cache.hit, true);
+    assert.equal(jobStats(tmp()).report(first.download).cache.hit, false);
     second.release();
   } finally {
     server.closeAllConnections?.();
@@ -208,7 +211,8 @@ test('without the volume the per-worker behaviour is unchanged', async () => {
     const url = `http://127.0.0.1:${server.address().port}/footage/s.mp4`;
     const got = await cachedSource(url, { dir: path.join(local, 'worker'), fallback, volume: volumeCacheDir({ D360_CACHE_DIR: '/nonexistent-volume-xyz/d360-cache' }) });
     assert.ok(got.path.startsWith(path.join(local, 'worker')));
-    assert.equal(got.download.cache, undefined);
+    assert.equal(got.download.cache.volume, false);
+    assert.equal(got.download.cache.hit, false);
     assert.equal(got.download.cached, false);
     got.release();
   } finally {
