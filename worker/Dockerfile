@@ -16,6 +16,9 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates aria2 tini \
  && pip3 install --no-cache-dir --break-system-packages 'runpod==1.12.0' \
  && rm -rf /var/lib/apt/lists/*
+# The info overlay needs ffmpeg's `ass` filter (libass). Debian's ffmpeg has it; fail the
+# build if a different package ever drops it. The font it draws with is lib/fonts/DejaVuSansMono.ttf (copied below).
+RUN ffmpeg -hide_banner -filters 2>/dev/null | grep -Eq '^ *[A-Z.]+ +ass +V->V'
 COPY --from=gpmf /src/gpmf2json /usr/local/bin/gpmf2json
 ENV GPMF2JSON=/usr/local/bin/gpmf2json
 COPY --from=gpmf /src/third_party/gpmf-parser/LICENSE-MIT /usr/local/share/gpmf-parser/LICENSE-MIT
@@ -25,6 +28,7 @@ WORKDIR /app
 COPY package.json ./
 COPY src ./src
 COPY lib ./lib
+RUN test -s /app/lib/fonts/DejaVuSansMono.ttf
 COPY worker ./worker
 # Shown as the worker's commit in logs and stats; the version itself is a hash of the files.
 ARG GIT_SHA=
