@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fieldOfView } from '../src/formats.js';
-import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl } from '../src/edl.js';
+import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl, trimFrames } from '../src/edl.js';
 
 test('chunk length is at least the minimum and otherwise the clip over two waves of cores', () => {
   assert.equal(chunkMinSeconds(110, 16, {}), 4);
@@ -42,6 +42,30 @@ test('a long pan splits on the same ease, and the next chunk does not restart it
   );
   const pitchedChunks = planChunks(pitchedSegments, { totalFrames: 60, fps: 30, chunkSeconds: 1 });
   assert.equal(pitchedChunks.some((chunk) => chunk.type === 'pan' && chunk.yawOnly), false);
+});
+
+test('a trim keeps only its frames: chunks tile the kept range and a pan cut in half keeps its own ease', () => {
+  const segments = planSegments(
+    [{ t: 0, camera: 1 }, { t: 8, camera: 2, panSpeed: 10 }],
+    [0, 40],
+    [0, 0],
+    8,
+  );
+  const { fromFrame, toFrame } = trimFrames({ start: 1, end: 6 }, 30, 240);
+  assert.deepEqual([fromFrame, toFrame], [30, 180]);
+  const chunks = planChunks(segments, { totalFrames: 240, fps: 30, chunkSeconds: 1, fromFrame, toFrame });
+  assert.equal(chunks[0].seekFrame, 30);
+  assert.equal(chunks.reduce((sum, chunk) => sum + chunk.frames, 0), 150);
+  for (let i = 1; i < chunks.length; i += 1) assert.equal(chunks[i].seekFrame, chunks[i - 1].seekFrame + chunks[i - 1].frames);
+  const pan = chunks.filter((chunk) => chunk.type === 'pan');
+  // The pan runs 4s..8s (frames 120..240); the trim ends at frame 180, two chunks into it.
+  assert.deepEqual(pan.map((chunk) => [chunk.index0, chunk.frames, chunk.panFrames]), [[0, 30, 120], [30, 30, 120]]);
+  const late = planChunks(segments, { totalFrames: 240, fps: 30, chunkSeconds: 1, ...trimFrames({ start: 5.5, end: 8 }, 30, 240) });
+  assert.equal(late[0].type, 'pan');
+  assert.equal(late[0].index0, 45);
+  assert.equal(late[0].seekFrame, 165);
+  assert.deepEqual(trimFrames(null, 30, 240), { fromFrame: 0, toFrame: 240 });
+  assert.throws(() => trimFrames({ start: 3, end: 3 }, 30, 240), /keeps no frames/);
 });
 
 function ffmpeg(args) {
@@ -340,6 +364,33 @@ test('a pitch pan across camera rows keeps frame count, border continuity, and s
       if (value == null) delete process.env[key];
       else process.env[key] = value;
     }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('a trimmed render has the kept frames only, with the sound of that stretch', { timeout: 120000 }, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-trim-'));
+  try {
+    const src = path.join(tmp, 'src.mp4');
+    // Silence for 2s, then a tone: a trim from 2s starts on the tone.
+    ffmpeg([
+      '-f', 'lavfi', '-i', 'testsrc2=size=960x480:rate=30:duration=4',
+      '-f', 'lavfi', '-i', 'aevalsrc=if(lt(t\\,2)\\,0\\,0.5*sin(2*PI*440*t)):s=48000:d=4',
+      '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', src,
+    ]);
+    const out = path.join(tmp, 'out.mp4');
+    const rendered = await renderFromEdl(src, out, [{ t: 0, camera: 1 }, { t: 3, camera: 2, panSpeed: 24 }], {
+      format: 'youtube', yaws: [0, 24], pitches: [0, 0], width: 160, height: 90, preview: true,
+      trim: { start: 2, end: 3.5 },
+    });
+    assert.equal(rendered.frames, 45);
+    const facts = JSON.parse(ffprobe(['-count_frames', '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames', '-show_entries', 'format=duration', '-of', 'json', out]));
+    assert.equal(Number(facts.streams[0].nb_read_frames), 45);
+    assert.ok(Math.abs(Number(facts.format.duration) - 1.5) < 0.1);
+    const head = spawnSync('ffmpeg', ['-hide_banner', '-t', '0.4', '-i', out, '-map', '0:a', '-af', 'volumedetect', '-f', 'null', '-'], { encoding: 'utf8' }).stderr;
+    const mean = Number(/mean_volume: (-?[\d.]+) dB/.exec(head)?.[1]);
+    assert.ok(mean > -20, `the trimmed sound starts on the tone (mean ${mean} dB)`);
+  } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
