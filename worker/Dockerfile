@@ -29,6 +29,7 @@ COPY package.json ./
 COPY src ./src
 COPY lib ./lib
 RUN test -s /app/lib/fonts/DejaVuSansMono.ttf
+RUN test -d /app/lib/emoji
 COPY worker ./worker
 # Shown as the worker's commit in logs and stats; the version itself is a hash of the files.
 ARG GIT_SHA=
