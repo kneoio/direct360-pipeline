@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fieldOfView } from '../src/formats.js';
-import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl, trimFrames } from '../src/edl.js';
+import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl, keptFrameRanges } from '../src/edl.js';
 
 test('chunk length is at least the minimum and otherwise the clip over two waves of cores', () => {
   assert.equal(chunkMinSeconds(110, 16, {}), 4);
@@ -51,21 +51,21 @@ test('a trim keeps only its frames: chunks tile the kept range and a pan cut in 
     [0, 0],
     8,
   );
-  const { fromFrame, toFrame } = trimFrames({ start: 1, end: 6 }, 30, 240);
-  assert.deepEqual([fromFrame, toFrame], [30, 180]);
-  const chunks = planChunks(segments, { totalFrames: 240, fps: 30, chunkSeconds: 1, fromFrame, toFrame });
+  const ranges = keptFrameRanges([{ start: 1, end: 6 }], 30, 240);
+  assert.deepEqual(ranges, [{ fromFrame: 30, toFrame: 180 }]);
+  const chunks = planChunks(segments, { totalFrames: 240, fps: 30, chunkSeconds: 1, ranges });
   assert.equal(chunks[0].seekFrame, 30);
   assert.equal(chunks.reduce((sum, chunk) => sum + chunk.frames, 0), 150);
   for (let i = 1; i < chunks.length; i += 1) assert.equal(chunks[i].seekFrame, chunks[i - 1].seekFrame + chunks[i - 1].frames);
   const pan = chunks.filter((chunk) => chunk.type === 'pan');
   // The pan runs 4s..8s (frames 120..240); the trim ends at frame 180, two chunks into it.
   assert.deepEqual(pan.map((chunk) => [chunk.index0, chunk.frames, chunk.panFrames]), [[0, 30, 120], [30, 30, 120]]);
-  const late = planChunks(segments, { totalFrames: 240, fps: 30, chunkSeconds: 1, ...trimFrames({ start: 5.5, end: 8 }, 30, 240) });
+  const late = planChunks(segments, { totalFrames: 240, fps: 30, chunkSeconds: 1, ranges: keptFrameRanges([{ start: 5.5, end: 8 }], 30, 240) });
   assert.equal(late[0].type, 'pan');
   assert.equal(late[0].index0, 45);
   assert.equal(late[0].seekFrame, 165);
-  assert.deepEqual(trimFrames(null, 30, 240), { fromFrame: 0, toFrame: 240 });
-  assert.throws(() => trimFrames({ start: 3, end: 3 }, 30, 240), /keeps no frames/);
+  assert.deepEqual(keptFrameRanges(null, 30, 240), [{ fromFrame: 0, toFrame: 240 }]);
+  assert.throws(() => keptFrameRanges([{ start: 3, end: 3 }], 30, 240), /keep no frames/);
 });
 
 function ffmpeg(args) {
@@ -381,7 +381,7 @@ test('a trimmed render has the kept frames only, with the sound of that stretch'
     const out = path.join(tmp, 'out.mp4');
     const rendered = await renderFromEdl(src, out, [{ t: 0, camera: 1 }, { t: 3, camera: 2, panSpeed: 24 }], {
       format: 'youtube', yaws: [0, 24], pitches: [0, 0], width: 160, height: 90, preview: true,
-      trim: { start: 2, end: 3.5 },
+      ranges: [{ start: 2, end: 3.5 }],
     });
     assert.equal(rendered.frames, 45);
     const facts = JSON.parse(ffprobe(['-count_frames', '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames', '-show_entries', 'format=duration', '-of', 'json', out]));
