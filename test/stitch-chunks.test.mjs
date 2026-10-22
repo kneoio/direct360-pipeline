@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { eacToEquirectFilter, stitchGopro, stitchPreset } from '../src/gopro.js';
 import { chunkMinSeconds, containerLimits, planChunks } from '../src/edl.js';
-import { buildMatrix } from '../src/matrix.js';
+import { buildMatrix, MATRIX_FPS } from '../src/matrix.js';
 
 test('stitch preset is medium unless D360_STITCH_PRESET names an x264 preset', () => {
   assert.equal(stitchPreset({}), 'medium');
@@ -127,7 +127,8 @@ test('matrix and proxy keep frame count, size, and audio', { timeout: 120000 }, 
       '-show_entries', 'format=duration',
       '-of', 'json', proxy,
     ]));
-    assert.equal(gridFrames, Math.round(2 * 12));
+    // A 30 fps source plays at its own rate, up to the cap.
+    assert.equal(gridFrames, Math.round(2 * Math.min(30, MATRIX_FPS)));
     assert.equal(Number(proxyInfo.streams[0].nb_read_packets), 60);
     assert.equal(proxyInfo.streams[0].width, 2048);
     assert.equal(proxyInfo.streams[0].height, 1024);
