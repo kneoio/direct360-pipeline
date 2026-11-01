@@ -272,6 +272,7 @@ int main(int argc, char **argv) try {
     av_frame_free(&dst);
     drainEncoder();
     n++;
+    if (n % 25 == 0) fprintf(stderr, "frame %ld\n", n);
   }
   CHECK(avcodec_send_frame(enc, nullptr));
   drainEncoder();
@@ -288,5 +289,6 @@ int main(int argc, char **argv) try {
   _exit(0);
 } catch (const std::exception &e) {
   fprintf(stderr, "gpu-stitch: %s\n", e.what());
-  return 1;
+  fflush(stdout);
+  _exit(1);
 }

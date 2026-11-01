@@ -11,6 +11,17 @@ WORKDIR /src
 COPY worker/gpmf /src
 RUN make
 
+# The GPU stitch, used when the endpoint sets D360_STITCH_ENGINE=gpu. PTX only, so
+# the driver compiles the kernels for whatever card the worker has.
+FROM debian:bookworm-slim AS gpustitch
+RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends nvidia-cuda-toolkit nvidia-cuda-dev g++ libavcodec-dev libavformat-dev libavutil-dev pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY gpu-stitch /src
+RUN nvcc -O3 --std=c++17 --cudart static -arch=compute_75 -code=compute_75 -x cu main.cu -o gpu-stitch -lavformat -lavcodec -lavutil
+
 FROM node:20-bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates aria2 tini \
@@ -24,6 +35,9 @@ ENV GPMF2JSON=/usr/local/bin/gpmf2json
 COPY --from=gpmf /src/third_party/gpmf-parser/LICENSE-MIT /usr/local/share/gpmf-parser/LICENSE-MIT
 COPY --from=gpmf /src/third_party/gpmf-parser/LICENSE-APACHE /usr/local/share/gpmf-parser/LICENSE-APACHE
 COPY --from=gpmf /src/third_party/gpmf-parser/LICENSE.txt /usr/local/share/gpmf-parser/LICENSE.txt
+COPY --from=gpustitch /src/gpu-stitch /usr/local/bin/gpu-stitch
+# Asks the NVIDIA runtime for the video decode and encode libraries too.
+ENV NVIDIA_DRIVER_CAPABILITIES=all
 WORKDIR /app
 COPY package.json ./
 COPY src ./src

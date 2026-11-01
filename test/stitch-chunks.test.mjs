@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { eacToEquirectFilter, stitchGopro, stitchPreset } from '../src/gopro.js';
+import { eacToEquirectFilter, stitchGopro, stitchPreset, stitchEngine, gpuStitchCq } from '../src/gopro.js';
 import { chunkMinSeconds, containerLimits, planChunks } from '../src/edl.js';
 import { buildMatrix, MATRIX_FPS } from '../src/matrix.js';
 
@@ -147,4 +147,12 @@ test('matrix and proxy keep frame count, size, and audio', { timeout: 120000 }, 
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test('the stitch engine is cpu by default and rejects unknown values', () => {
+  assert.equal(stitchEngine({}), 'cpu');
+  assert.equal(stitchEngine({ D360_STITCH_ENGINE: 'gpu' }), 'gpu');
+  assert.throws(() => stitchEngine({ D360_STITCH_ENGINE: 'nvidia' }), /cpu or gpu/);
+  assert.equal(gpuStitchCq({}), 24);
+  assert.throws(() => gpuStitchCq({ D360_STITCH_GPU_CQ: 'high' }), /whole number/);
 });
