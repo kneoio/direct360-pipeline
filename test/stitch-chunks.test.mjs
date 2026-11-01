@@ -8,9 +8,9 @@ import { eacToEquirectFilter, stitchGopro, stitchPreset } from '../src/gopro.js'
 import { chunkMinSeconds, containerLimits, planChunks } from '../src/edl.js';
 import { buildMatrix, MATRIX_FPS } from '../src/matrix.js';
 
-test('stitch preset is medium unless D360_STITCH_PRESET names an x264 preset', () => {
-  assert.equal(stitchPreset({}), 'medium');
-  assert.equal(stitchPreset({ D360_STITCH_PRESET: 'veryfast' }), 'veryfast');
+test('stitch preset is veryfast unless D360_STITCH_PRESET names an x264 preset', () => {
+  assert.equal(stitchPreset({}), 'veryfast');
+  assert.equal(stitchPreset({ D360_STITCH_PRESET: 'medium' }), 'medium');
   assert.throws(() => stitchPreset({ D360_STITCH_PRESET: 'placebo' }), /D360_STITCH_PRESET/);
 });
 
