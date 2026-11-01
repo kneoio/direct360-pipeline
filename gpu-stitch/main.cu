@@ -78,7 +78,8 @@ __device__ inline float bilinearAt(const Plane &pl, int lens, float x, float y, 
   return top * (1 - v) + bot * v;
 }
 
-static const int BLOCK = 64;
+// A CUDA block holds at most 1024 threads.
+static const int BLOCK = 32;
 
 __global__ void lumaKernel(const Entry *lut, Plane pl, uint8_t *out, int outPitch, int ow, float gain, float lift) {
   int x = blockIdx.x * BLOCK + threadIdx.x, y = blockIdx.y * BLOCK + threadIdx.y;
@@ -182,6 +183,9 @@ int main(int argc, char **argv) try {
   enc->framerate = rate;
   enc->color_range = AVCOL_RANGE_MPEG;
   enc->bit_rate = 0;
+  // Without a higher cap NVENC stops at 50 Mbit/s and cq has no effect.
+  enc->rc_max_rate = 400000000;
+  enc->rc_buffer_size = 800000000;
   av_opt_set(enc->priv_data, "preset", "p4", 0);
   av_opt_set(enc->priv_data, "rc", "vbr", 0);
   av_opt_set(enc->priv_data, "cq", cq, 0);
@@ -259,6 +263,7 @@ int main(int argc, char **argv) try {
     dim3 block(BLOCK, BLOCK);
     lumaKernel<<<dim3((ow + BLOCK - 1) / BLOCK, (oh + BLOCK - 1) / BLOCK), block>>>(devY, py, dst->data[0], dst->linesize[0], ow, gainY, lift);
     chromaKernel<<<dim3((cw + BLOCK - 1) / BLOCK, (ch + BLOCK - 1) / BLOCK), block>>>(devC, pc, dst->data[1], dst->linesize[1], cw, gainC, center);
+    CUDA(cudaGetLastError());
     CUDA(cudaDeviceSynchronize());
     av_frame_free(&a);
     av_frame_free(&b);
@@ -278,7 +283,9 @@ int main(int argc, char **argv) try {
   getrusage(RUSAGE_SELF, &ru);
   double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
   printf("frames %ld  wall %.1fs  %.1f fps  cpu %.0fs\n", n, wall, n / wall, cpu);
-  return 0;
+  fflush(stdout);
+  // A normal return hangs in the CUDA and NVENC teardown, and the file is already closed.
+  _exit(0);
 } catch (const std::exception &e) {
   fprintf(stderr, "gpu-stitch: %s\n", e.what());
   return 1;
