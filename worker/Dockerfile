@@ -21,6 +21,7 @@ RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmwa
 WORKDIR /src
 COPY gpu-stitch /src
 RUN nvcc -O3 --std=c++17 --cudart static -arch=compute_75 -code=compute_75 -x cu main.cu -o gpu-stitch -lavformat -lavcodec -lavutil
+RUN gcc -shared -fPIC -O2 -o libnvenc_one_gpu.so nvenc_one_gpu.c -ldl
 
 FROM node:20-bookworm-slim
 RUN apt-get update \
@@ -36,6 +37,7 @@ COPY --from=gpmf /src/third_party/gpmf-parser/LICENSE-MIT /usr/local/share/gpmf-
 COPY --from=gpmf /src/third_party/gpmf-parser/LICENSE-APACHE /usr/local/share/gpmf-parser/LICENSE-APACHE
 COPY --from=gpmf /src/third_party/gpmf-parser/LICENSE.txt /usr/local/share/gpmf-parser/LICENSE.txt
 COPY --from=gpustitch /src/gpu-stitch /usr/local/bin/gpu-stitch
+COPY --from=gpustitch /src/libnvenc_one_gpu.so /usr/local/lib/libnvenc_one_gpu.so
 # Asks the NVIDIA runtime for the video decode and encode libraries too.
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 WORKDIR /app
