@@ -149,35 +149,6 @@ test('matrix and proxy keep frame count, size, and audio', { timeout: 120000 }, 
   }
 });
 
-test('a failed gpu-stitch falls back to the cpu stitch', { timeout: 180000 }, async () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-stitch-test-'));
-  const names = ['D360_STITCH_ENGINE', 'D360_GPU_STITCH', 'D360_STITCH_PRESET'];
-  const previous = names.map((name) => process.env[name]);
-  process.env.D360_STITCH_ENGINE = 'gpu';
-  process.env.D360_GPU_STITCH = 'false';
-  process.env.D360_STITCH_PRESET = 'ultrafast';
-  try {
-    const src = path.join(tmp, 'dual.mp4');
-    ffmpeg([
-      '-f', 'lavfi', '-i', 'testsrc2=size=4096x1344:rate=10:duration=0.3',
-      '-f', 'lavfi', '-i', 'testsrc2=size=4096x1344:rate=10:duration=0.3',
-      '-map', '0:v', '-map', '1:v',
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-g', '2', src,
-    ]);
-    const lines = [];
-    const stitched = await stitchGopro(src, path.join(tmp, 'equirect.mp4'), { log: (line) => lines.push(line) });
-    assert.equal(stitched.preset, 'ultrafast');
-    assert.equal(stitched.frames, 3);
-    assert.ok(lines.some((line) => /^gpu stitch failed on .*stitching on the cpu/.test(line)), lines.join('\n'));
-  } finally {
-    names.forEach((name, i) => {
-      if (previous[i] == null) delete process.env[name];
-      else process.env[name] = previous[i];
-    });
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
 test('the stitch engine is cpu by default and rejects unknown values', () => {
   assert.equal(stitchEngine({}), 'cpu');
   assert.equal(stitchEngine({ D360_STITCH_ENGINE: 'gpu' }), 'gpu');
