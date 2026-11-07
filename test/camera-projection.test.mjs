@@ -69,6 +69,10 @@ test('projected field of view: flat as today, fisheye by angle, planet by tan(fo
   // Pannini zooms by cropping a larger square; a wider fov is a smaller square.
   assert.equal(projectionStage('flat', 192, 108, 100).crop, '');
   assert.ok(panniniSide(1920, 1080, 120) > panniniSide(1920, 1080, 170));
+  // Across the long side: a tall 9:16 frame zooms too (it used to be held at its height whatever the fov).
+  assert.ok(panniniSide(1080, 1920, 120) > panniniSide(1080, 1920, 170));
+  assert.ok(panniniSide(1080, 1920, 170) >= 1920);
+  assert.equal(panniniSide(1080, 1920, 140), panniniSide(1920, 1080, 140), 'the same zoom on the long side either way round');
   assert.equal(projectionStage('pannini', 192, 108, 140).crop, 'crop=192:108');
 });
 
