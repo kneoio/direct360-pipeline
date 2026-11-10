@@ -4,12 +4,12 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fieldOfView } from '../src/formats.js';
-import { buildMatrix, layoutFovs, layoutRolls, matrixCellSize, sanitizeLayouts } from '../src/matrix.js';
+import { fieldOfView } from 'direct360-helper/src/formats.js';
+import { buildMatrix, layoutFovs, layoutRolls, matrixCellSize, sanitizeLayouts } from 'direct360-helper/src/matrix.js';
 import {
   chunkCost, panFieldOfView, panPose, planChunks, planSegments, renderFromEdl, resolveView, stabilizedCommands,
-} from '../src/edl.js';
-import { aimQuat, composeView, qaxis, viewAngles } from '../src/stabilize.js';
+} from 'direct360-helper/src/edl.js';
+import { aimQuat, composeView, qaxis, viewAngles } from 'direct360-helper/src/stabilize.js';
 
 // ---------------------------------------------------------------- layouts
 const youtubeLayout = (extra = {}) => ({

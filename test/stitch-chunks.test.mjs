@@ -4,9 +4,9 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { eacToEquirectFilter, stitchGopro, stitchPreset, stitchEngine, gpuStitchCq } from '../src/gopro.js';
-import { chunkMinSeconds, containerLimits, planChunks } from '../src/edl.js';
-import { buildMatrix, MATRIX_FPS } from '../src/matrix.js';
+import { eacToEquirectFilter, stitchGopro, stitchPreset, stitchEngine, gpuStitchCq } from 'direct360-helper/src/gopro.js';
+import { chunkMinSeconds, containerLimits, planChunks } from 'direct360-helper/src/edl.js';
+import { buildMatrix, MATRIX_FPS } from 'direct360-helper/src/matrix.js';
 
 test('stitch preset is veryfast unless D360_STITCH_PRESET names an x264 preset', () => {
   assert.equal(stitchPreset({}), 'veryfast');
