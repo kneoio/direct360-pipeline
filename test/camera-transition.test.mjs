@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  PAN_KINDS, PLANET_FADE, planSegments, renderFromEdl, sanitizeEdl, transitionFov, transitionKinds, transitionWeight,
+  PAN_KINDS, PLANET_FADE, centreScale, planSegments, renderFromEdl, sanitizeEdl, transitionFovs, transitionKinds, transitionWeight,
 } from 'direct360-helper/src/edl.js';
 
 // ---------------------------------------------------------------- planning
@@ -30,10 +30,28 @@ test('the new picture fades in along the pan for blend; planet fades only at its
   assert.equal(transitionWeight('planet', 'planet', 0.5), 0);
   assert.equal(transitionWeight('planet', 'planet', 1 - PLANET_FADE / 2), 0.5);
   assert.equal(transitionWeight('planet', 'planet', 1), 1);
-  // Flat cannot draw 180°; pannini keeps its own zoom; planet and fisheye follow the pan.
-  assert.equal(transitionFov('flat', 260, 100), 120);
-  assert.equal(transitionFov('pannini', 200, 140), 140);
-  assert.equal(transitionFov('planet', 150, 260), 150);
+});
+
+test('both pictures of a transition show the middle of the frame at the same size, from the first camera to the second', () => {
+  const flat = { projection: 'flat', fov: 100 };
+  const planet = { projection: 'planet', fov: 260 };
+  const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-6, `${a} vs ${b}`);
+  near(transitionFovs(flat, planet, 0).from, 100);
+  near(transitionFovs(flat, planet, 1).to, 260);
+  for (const p of [0, 0.3, 0.7, 1]) {
+    const f = transitionFovs(flat, planet, p);
+    near(centreScale('flat', f.from), centreScale('planet', f.to));
+    assert.ok(f.from < 180, 'flat never reaches 180°');
+  }
+  // The size moves evenly (in log) between the two cameras'.
+  const mid = transitionFovs(flat, planet, 0.5);
+  near(centreScale('flat', mid.from), Math.sqrt(centreScale('flat', 100) * centreScale('planet', 260)));
+  const fish = transitionFovs({ projection: 'fisheye', fov: 160 }, { projection: 'flat', fov: 90 }, 0.4);
+  near(centreScale('fisheye', fish.from), centreScale('flat', fish.to));
+  // Pannini keeps its own zoom; the other picture moves between the two fovs.
+  const pan = transitionFovs(flat, { projection: 'pannini', fov: 150 }, 0.5);
+  assert.equal(pan.to, 150);
+  assert.equal(pan.from, 120);
 });
 
 test('an edit list keeps a transition kind only with a pan speed', () => {
