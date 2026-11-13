@@ -4,7 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { uploadParts } from 'direct360-helper/worker/render.js';
+import { uploadParts } from 'direct360-pipeline/worker/render.js';
 
 test('the worker output carries upload counts, not per-part etags', async () => {
   const server = http.createServer((req, res) => {

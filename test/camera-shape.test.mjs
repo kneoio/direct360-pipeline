@@ -6,9 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   BULGE_REACH, bulgeOf, bulgeReach, bulgeWarp, fieldOfView, hasBulge, projectedFieldOfView, projectionStage, sameBulge,
-} from 'direct360-helper/src/formats.js';
-import { buildMatrix, layoutBulges, sanitizeLayouts } from 'direct360-helper/src/matrix.js';
-import { planSegments, renderFromEdl, resolveView } from 'direct360-helper/src/edl.js';
+} from 'direct360-pipeline/src/formats.js';
+import { buildMatrix, layoutBulges, sanitizeLayouts } from 'direct360-pipeline/src/matrix.js';
+import { planSegments, renderFromEdl, resolveView } from 'direct360-pipeline/src/edl.js';
 
 const youtubeLayout = (extra = {}) => ({
   yaws: Array.from({ length: 18 }, (_, i) => i * 10),

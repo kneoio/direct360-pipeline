@@ -4,8 +4,8 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fieldOfView } from 'direct360-helper/src/formats.js';
-import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl, keptFrameRanges } from 'direct360-helper/src/edl.js';
+import { fieldOfView } from 'direct360-pipeline/src/formats.js';
+import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl, keptFrameRanges } from 'direct360-pipeline/src/edl.js';
 
 test('chunk length is at least the minimum and otherwise the clip over two waves of cores', () => {
   assert.equal(chunkMinSeconds(110, 16, {}), 4);
