@@ -1,11 +1,10 @@
 // RunPod worker job: the server's heavy steps, on RunPod hardware instead —
 // `task: "render"` (default) is renderFromEdl (preview or final, from the
-// job's `preview` flag), `task: "matrix"` is buildMatrix for freshly uploaded
-// footage, `task: "stitch"` turns a GoPro MAX .360 into one equirectangular
-// MP4, `task: "stitch_matrix"` does that stitch and the matrix in one
-// download, `task: "proxy"` builds only the preview proxy of a normal (flat)
-// video, which has no camera matrix, and `task: "telemetry"` reads GPMF from the stored source and
-// PUTs telemetry.json. Reads the job input as JSON on stdin, downloads the
+// job's `preview` flag), `task: "stitch"` turns a GoPro MAX .360 into one
+// equirectangular MP4, `task: "proxy"` builds the preview proxy (`mode` 360:
+// equirect, flat: a normal video), `task: "stitch_proxy"` does the stitch and
+// the 360° proxy in one download, and `task: "telemetry"` reads GPMF from the
+// stored source and PUTs telemetry.json. Reads the job input as JSON on stdin, downloads the
 // source with aria2c (several Range connections; the single-connection GET
 // remains the fallback), runs the task, uploads the result back to the
 // server in 8MB chunks (same size the browser uploads use, so it fits
@@ -24,10 +23,10 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { containerLimits, renderFromEdl } from '../src/edl.js';
-import { buildFlatProxy, buildMatrix, LEGACY_MATRIX_FPS } from '../src/matrix.js';
+import { buildEquirectProxy, buildFlatProxy } from '../src/matrix.js';
 import { stitchGopro } from '../src/gopro.js';
 import { captureTelemetry, captureOrientation, orientationLogLine } from '../src/telemetry.js';
-import { extractAudioTrack, startDiskWatch } from '../src/ffmpegTools.js';
+import { startDiskWatch } from '../src/ffmpegTools.js';
 import { workerVersion } from '../src/version.js';
 import { assertOverlayAvailable, OVERLAY_UNAVAILABLE } from '../src/overlayFilter.js';
 import { computeCorrection, decodeOrientation, stabModeValid } from '../src/stabilize.js';
@@ -483,7 +482,7 @@ async function volumeSource(url, info, volume, { watch } = {}) {
 
 /** Tasks whose input is the original upload (.360), which only the stitch needs and the cache must not keep. */
 export function discardsSource(task) {
-  return task === 'stitch' || task === 'stitch_matrix';
+  return task === 'stitch' || task === 'stitch_proxy';
 }
 
 /** Puts a file this worker just uploaded into the volume cache. Never fails the job. */
@@ -714,7 +713,7 @@ async function uploadTelemetry(src, putUrl, orientationPutUrl = null) {
 }
 
 /**
- * Per-frame correction quaternions for a stabilized render or matrix, from the
+ * Per-frame correction quaternions for a stabilized render, from the
  * orientation file at a presigned URL. Null when stabilization is off.
  * Every part job computes the whole track, so frame numbers are global.
  */
@@ -1176,7 +1175,6 @@ async function main() {
     chunk_range = null, part_upload = null, audio_upload = null, chunk_seconds = null,
     expected_chunks = null, expected_frames = null,
     overlay_url = null, metadata = null, ranges = null,
-    part_range = null, matrix_upload = null, include_audio = true, expected_matrix_frames = null,
     stitch_engine = null,
   } = input;
   // The server names the stitch engine per job when it runs a CPU and a GPU
@@ -1192,20 +1190,12 @@ async function main() {
     console.log(JSON.stringify(bench));
     return;
   }
-  if (task !== 'render' && task !== 'matrix' && task !== 'stitch' && task !== 'stitch_matrix' && task !== 'telemetry' && task !== 'proxy') {
+  if (task !== 'render' && task !== 'stitch' && task !== 'telemetry' && task !== 'proxy' && task !== 'stitch_proxy') {
     throw new Error(`unknown task "${task}"`);
-  }
-  const uploadPartJob = Boolean(part_range);
-  if (uploadPartJob && task !== 'matrix' && task !== 'stitch_matrix') {
-    throw new Error('part_range is only supported for matrix and stitch_matrix');
-  }
-  if (uploadPartJob && !Number.isInteger(expected_matrix_frames)) {
-    throw new Error('a matrix/stitch_matrix part needs expected_matrix_frames');
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-'));
   workerInfo();
   const stats = jobStats(dir);
-  let sourceUpload = null;
   let releaseCache = () => {};
   try {
     // Every task downloads its input to local disk first (aria2c, several
@@ -1214,7 +1204,7 @@ async function main() {
     // part of the same job landing here reuses it; on the Helper Agent
     // (D360_SOURCE_CACHE_MAX_GB) every job does, so the next job on the same
     // footage skips the download.
-    const partJob = uploadPartJob || Array.isArray(chunk_range);
+    const partJob = Array.isArray(chunk_range);
     let src;
     let download;
     if (partJob || volumeCacheDir() || sourceCacheMaxBytes() > 0) {
@@ -1233,39 +1223,49 @@ async function main() {
     const { cpus, mem } = containerLimits();
     if (task !== 'render') log(`${cpus} cpus, ${(mem / 1024 ** 3).toFixed(2)} GB memory`);
 
-    if (task === 'proxy') {
-      if (!proxy_upload) throw new Error('a proxy job needs proxy_upload');
+    // The preview proxy, and for a .360 the stitch before it: what a footage needs (no camera grid; the editor draws
+    // every camera live from the proxy). `mode` says which proxy: '360' (equirect) or 'flat'.
+    if (task === 'proxy' || task === 'stitch_proxy') {
+      if (!proxy_upload) throw new Error(`a ${task} job needs proxy_upload`);
+      if (mode !== '360' && mode !== 'flat') throw new Error(`a ${task} job needs mode 360 or flat, got ${JSON.stringify(mode)}`);
+      if (task === 'stitch_proxy' && mode !== '360') throw new Error('stitch_proxy is for a 360° .360 only');
       const telemetryOut = await uploadTelemetry(src, telemetry_put, orientation_put);
+      let media = src;
+      let sourceUploaded = null;
+      if (task === 'stitch_proxy') {
+        media = path.join(dir, 'equirect.mp4');
+        const stitchRun = await stats.timed('stitch', () => stitchGopro(src, media, {
+          includeAudio: true,
+          onProgress: (frac) => report({ phase: 'stitch', progress: Math.round(frac * 100) }),
+          log,
+        }));
+        stats.add('audio', stitchRun?.audioMs);
+        stats.add('concat', stitchRun?.concatMs);
+        stats.ffmpeg(stitchRun?.peak);
+        log('GoPro .360 stitched to equirectangular');
+        if (source_upload) sourceUploaded = await stats.timed('upload', () => uploadParts(media, source_upload, 'stitched source', { cache: true }));
+      }
       const proxyFile = path.join(dir, 'proxy.mp4');
-      await stats.timed('matrix', () => buildFlatProxy(src, proxyFile, {
+      const buildProxy = mode === '360' ? buildEquirectProxy : buildFlatProxy;
+      await stats.timed('proxy', () => buildProxy(media, proxyFile, {
         log,
-        onProgress: (frac) => report({ phase: 'matrix', progress: Math.round(frac * 100) }),
+        onProgress: (frac) => report({ phase: 'proxy', progress: Math.round(frac * 100) }),
       }));
       stats.ffmpeg(1);
       log(`preview proxy ${fs.statSync(proxyFile).size} bytes`);
       const proxyUploaded = await stats.timed('upload', () => uploadParts(proxyFile, proxy_upload, 'preview proxy', { cache: true }));
-      console.log(JSON.stringify({ proxy: proxyUploaded, telemetry: telemetryOut, download, ...stats.report(download) }));
+      console.log(JSON.stringify({ proxy: proxyUploaded, ...(sourceUploaded ? { source: sourceUploaded } : {}), telemetry: telemetryOut, download, ...stats.report(download) }));
       return;
     }
 
     const out = path.join(dir, 'out.mp4');
-    let proxyResult = null;
     let sourceResult = null;
     let telemetryResult = null;
-    // The stitch maps video and audio only, so the gpmd track has to be read
-    // from this download, before stitchGopro replaces it. A part job skips
-    // this — GPMF is scattered through the whole stream, so the server
-    // extracts it once, itself, decoupled from the parts (see editorServer.js).
-    if (!uploadPartJob && (task === 'stitch' || task === 'stitch_matrix' || task === 'matrix')) {
+    if (task === 'stitch') {
+      // The stitch maps video and audio only, so the gpmd track is read from this download first.
       telemetryResult = await uploadTelemetry(src, telemetry_put, orientation_put);
-    }
-    if (task === 'stitch' || task === 'stitch_matrix') {
-      const stitched = task === 'stitch' ? out : path.join(dir, 'equirect.mp4');
-      const audioOut = uploadPartJob ? path.join(dir, 'audio.m4a') : null;
-      const stitchRun = await stats.timed('stitch', () => stitchGopro(src, stitched, {
-        partRange: uploadPartJob ? part_range : null,
-        includeAudio: uploadPartJob ? Boolean(include_audio) : true,
-        audioOut,
+      const stitchRun = await stats.timed('stitch', () => stitchGopro(src, out, {
+        includeAudio: true,
         onProgress: (frac) => report({ phase: 'stitch', progress: Math.round(frac * 100) }),
         log,
       }));
@@ -1273,131 +1273,12 @@ async function main() {
       stats.add('concat', stitchRun?.concatMs);
       stats.ffmpeg(stitchRun?.peak);
       log('GoPro .360 stitched to equirectangular');
-      // A stitch with source_upload puts the stitched master straight into
-      // object storage (the next job, a matrix on another endpoint, reads it
-      // from there) and sends nothing back through result_url.
-      if (task === 'stitch' && source_upload) {
-        sourceResult = await stats.timed('upload', () => uploadParts(stitched, source_upload, 'stitched source', { cache: true }));
+      // With source_upload the stitched master goes straight into object storage and nothing comes back through
+      // result_url.
+      if (source_upload) {
+        sourceResult = await stats.timed('upload', () => uploadParts(out, source_upload, 'stitched source', { cache: true }));
         console.log(JSON.stringify({ source: sourceResult, telemetry: telemetryResult, download, ...stats.report(download) }));
         return;
-      }
-      // The stitched master uploads while the matrix and proxy are still encoding.
-      if (task === 'stitch_matrix' && source_upload) {
-        let uploadError = null;
-        sourceUpload = stats.timed('upload', () => uploadParts(stitched, source_upload, 'stitched source', { cache: !uploadPartJob }))
-          .then((result) => { sourceResult = result; });
-        sourceUpload.catch((err) => { uploadError = err; });
-        sourceUpload.uploadError = () => uploadError;
-      }
-    }
-    if (task === 'matrix' || task === 'stitch_matrix') {
-      const proxyPath = proxy_upload ? path.join(dir, 'proxy.mp4') : null;
-      const media = task === 'stitch_matrix' ? path.join(dir, 'equirect.mp4') : src;
-      // A stitch_matrix part's `media` is already just this part's own,
-      // freshly-stitched segment (local frame 0 is this part's startFrame),
-      // so its own matrix pass seeks locally from 0 — not the source's
-      // global part_range. A matrix-only part reads `media` (the original
-      // source) directly, so it uses the global range as-is. The expected
-      // frame count is always computed from the global range either way —
-      // a whole-second part boundary makes the two identical (see the
-      // "Additional design notes" in the upload-fanout plan).
-      const matrixPartRange = uploadPartJob
-        ? (task === 'stitch_matrix' ? { startFrame: 0, frames: part_range.frames } : part_range)
-        : null;
-      const started = Date.now();
-      const matrixAbort = new AbortController();
-      const watchUpload = sourceUpload && setInterval(() => {
-        const err = sourceUpload.uploadError?.();
-        if (err) matrixAbort.abort();
-      }, 500);
-      watchUpload?.unref?.();
-      try {
-        const matrixStabilization = await loadStabilization(stabilization, orientation_url, uploadPartJob && task === 'stitch_matrix' ? part_range.startFrame : 0);
-        await stats.timed('matrix', () => buildMatrix(media, out, {
-          grid,
-          format,
-          yaws,
-          pitches,
-          rolls,
-          fovs,
-          projections,
-          bulges,
-          layout,
-          lenses,
-          // A job from a server that predates the cap counts a part's frames at 12.
-          maxFps: Number.isInteger(input.maxFps) ? input.maxFps : LEGACY_MATRIX_FPS,
-          proxyOut: proxyPath,
-          log,
-          partRange: matrixPartRange,
-          matrixFrames: uploadPartJob ? expected_matrix_frames : null,
-          stabilization: matrixStabilization,
-          onProgress: (frac) => report({ phase: 'matrix', progress: Math.round(frac * 100) }),
-          signal: matrixAbort.signal,
-        }));
-        stats.ffmpeg(1);
-      } catch (e) {
-        if (watchUpload) clearInterval(watchUpload);
-        const failed = sourceUpload?.uploadError?.();
-        if (failed) throw failed;
-        throw e;
-      }
-      if (watchUpload) clearInterval(watchUpload);
-      const uploadError = sourceUpload?.uploadError?.();
-      if (uploadError) throw uploadError;
-      if (sourceUpload) await sourceUpload;
-      const seconds = ((Date.now() - started) / 1000).toFixed(1);
-      log(`camera matrix built in ${seconds}s`);
-      if (uploadPartJob) {
-        // The worker refuses a mismatch rather than upload a part that
-        // doesn't tile correctly with its neighbors.
-        const matrixFrames = (await packetCount(out)).frames;
-        if (matrixFrames !== expected_matrix_frames) {
-          throw new Error(`matrix part produced ${matrixFrames} frames, expected ${expected_matrix_frames}`);
-        }
-        if (task === 'stitch_matrix') {
-          const stitchFrames = (await packetCount(path.join(dir, 'equirect.mp4'))).frames;
-          if (stitchFrames !== part_range.frames) {
-            throw new Error(`stitch part produced ${stitchFrames} frames, expected ${part_range.frames}`);
-          }
-        }
-        if (proxyPath) {
-          const proxyFrames = (await packetCount(proxyPath)).frames;
-          if (proxyFrames !== part_range.frames) {
-            throw new Error(`proxy part produced ${proxyFrames} frames, expected ${part_range.frames}`);
-          }
-        }
-        if (!matrix_upload) throw new Error('matrix/stitch_matrix part needs matrix_upload');
-        const matrixUploaded = await stats.timed('upload', () => uploadParts(out, matrix_upload, 'matrix part'));
-        // The stitched source, when present, already uploaded in the
-        // background above (the same `sourceUpload`/`sourceResult` the
-        // single-job path uses) — not re-uploaded here.
-        const sourceUploaded = sourceResult;
-        const proxyUploaded = proxyPath ? await stats.timed('upload', () => uploadParts(proxyPath, proxy_upload, 'proxy part')) : null;
-        let audioUploaded = null;
-        if (include_audio && audio_upload) {
-          const audioPath = task === 'stitch_matrix'
-            ? path.join(dir, 'audio.m4a')
-            : path.join(dir, 'audio-extract.m4a');
-          if (task === 'matrix') await stats.timed('audio', () => extractAudioTrack(src, audioPath, { log }));
-          if (fs.existsSync(audioPath)) audioUploaded = await stats.timed('upload', () => uploadParts(audioPath, audio_upload, 'upload audio'));
-        }
-        log(`upload part frames ${part_range.startFrame}-${part_range.startFrame + part_range.frames - 1} (matrix ${matrixFrames} frames) uploaded`);
-        console.log(JSON.stringify({
-          part: true,
-          matrix: matrixUploaded,
-          source: sourceUploaded,
-          proxy: proxyUploaded,
-          audio: audioUploaded,
-          part_range,
-          download,
-          ...stats.report(download),
-        }));
-        return;
-      }
-      if (proxyPath) {
-        const proxyBytes = fs.statSync(proxyPath).size;
-        log(`preview proxy ${proxyBytes} bytes`);
-        proxyResult = await stats.timed('upload', () => uploadParts(proxyPath, proxy_upload, 'preview proxy', { cache: true }));
       }
     } else if (task === 'render') {
       const partJob = Array.isArray(chunk_range);
@@ -1493,7 +1374,7 @@ async function main() {
     const chunks = sent.count;
     log(`result uploaded (${(size / 1e6).toFixed(1)} MB, ${chunks} chunks)`);
     stats.add('upload', Date.now() - uploadStarted);
-    const output = { chunks, bytes: size, proxy: proxyResult, source: sourceResult, telemetry: telemetryResult, download, ...stats.report(download) };
+    const output = { chunks, bytes: size, source: sourceResult, telemetry: telemetryResult, download, ...stats.report(download) };
     // RunPod's job-done can fail after the result is uploaded: the server also hears it here.
     try {
       await putSmall(`${result_url}/done`, Buffer.from(JSON.stringify(output)), 'done', 'application/json');
@@ -1503,7 +1384,6 @@ async function main() {
     console.log(JSON.stringify(output));
   } finally {
     stats.stop();
-    if (sourceUpload) await sourceUpload.catch(() => {});
     releaseCache({ discard: discardsSource(task) });
     fs.rmSync(dir, { recursive: true, force: true });
   }

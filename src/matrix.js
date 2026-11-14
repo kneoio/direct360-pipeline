@@ -276,7 +276,6 @@ export function sanitizeLayouts(raw) {
       throw bad(`${format} removed cameras must be numbers from 1 to ${cameras}`);
     }
     const off = [...new Set(removed)].sort((a, b) => a - b);
-    if (off.length >= cameras) throw bad(`${format} layout needs at least one camera`);
     out[format] = {
       yaws: yaws.map((y) => Math.round(normalizeYaw(y) * 100) / 100),
       pitches: pitches.map((p) => Math.round(Math.max(-90, Math.min(90, p)) * 100) / 100),
@@ -399,6 +398,46 @@ export function effectiveMatrixFps(srcFps) {
  * `flatProxySize`, aspect kept, source frame rate kept as an exact fraction
  * so previews share its time_base, audio copied (or encoded to AAC).
  */
+/**
+ * The 360° preview proxy on its own: the equirect scaled to 2048×1024 (proxyVideoArgs), source frame rate as an exact
+ * fraction, audio copied (or encoded to AAC). The editor plays this and draws every camera live from it, so a 360°
+ * footage needs no camera grid video.
+ */
+export async function buildEquirectProxy(src, proxyOut, { onProgress, signal, log } = {}) {
+  if (!proxyOut) throw new Error('a 360° proxy needs an output path');
+  const info = await probe(src);
+  const videoStream = info.streams.find((s) => s.codec_type === 'video');
+  if (!videoStream) throw new Error(`${src} has no video stream`);
+  const timing = videoTiming(videoStream);
+  const audio = info.streams.find((s) => s.codec_type === 'audio');
+  const w = MATRIX_PROXY_WIDTH;
+  const h = MATRIX_PROXY_WIDTH / 2;
+  fs.mkdirSync(path.dirname(proxyOut), { recursive: true });
+  const gop = Math.max(1, Math.round(timing.num / timing.den));
+  const args = [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    ...reconnectArgs(src),
+    '-i', src,
+    '-filter_complex_threads', String(Math.max(1, containerLimits().cpus)),
+    '-filter_complex', `[0:v]scale=${w}:${h}:flags=bilinear,format=yuv420p[proxy]`,
+  ];
+  if (onProgress && timing.duration) args.push('-progress', 'pipe:1');
+  args.push('-map', '[proxy]');
+  if (audio) args.push('-map', '0:a:0');
+  args.push(...proxyVideoArgs(gop, `${timing.num}/${timing.den}`));
+  if (audio) args.push(...(audio.codec_name === 'aac' ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '160k']));
+  args.push('-movflags', '+faststart', proxyOut);
+  const started = Date.now();
+  await run(FFMPEG, args, {
+    signal,
+    onProgress: onProgress && timing.duration
+      ? (secs) => onProgress(Math.min(1, Math.max(0, secs / timing.duration)))
+      : undefined,
+  });
+  log?.(`360° preview proxy ${w}x${h}, ${((Date.now() - started) / 1000).toFixed(1)}s`);
+  return { proxy: proxyOut, width: w, height: h, duration: timing.duration };
+}
+
 export async function buildFlatProxy(src, proxyOut, { onProgress, signal, log } = {}) {
   if (!proxyOut) throw new Error('a flat proxy needs an output path');
   const info = await probe(src);

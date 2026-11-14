@@ -222,37 +222,6 @@ test('without the volume the per-worker behaviour is unchanged', async () => {
   }
 });
 
-test('after a stitch_matrix job only the stitched source and the proxy remain', async () => {
-  const { server } = await serve(4096);
-  const volume = tmp();
-  const work = tmp();
-  const base = `http://127.0.0.1:${server.address().port}`;
-  const parts = [{ partNumber: 1, etag: '"00112233445566778899aabbccddeeff"' }];
-  try {
-    assert.equal(discardsSource('stitch_matrix'), true);
-    assert.equal(discardsSource('stitch'), true);
-    assert.equal(discardsSource('matrix'), false);
-    assert.equal(discardsSource('render'), false);
-    // The job: download the .360, produce and upload the stitched source and the proxy.
-    const original = await cachedSource(`${base}/footage/original.360?sig=1`, { volume });
-    assert.equal(fs.existsSync(original.path), true);
-    for (const name of ['equirect.mp4', 'proxy.mp4']) fs.writeFileSync(path.join(work, name), Buffer.alloc(512, name.length));
-    assert.equal(storeProduced(volume, path.join(work, 'equirect.mp4'), `${base}/footage/stitched.mp4?partNumber=1`, parts), true);
-    assert.equal(storeProduced(volume, path.join(work, 'proxy.mp4'), `${base}/footage/proxy.mp4?partNumber=1`, parts), true);
-    original.release({ discard: discardsSource('stitch_matrix') });
-    const left = fs.readdirSync(volume);
-    assert.deepEqual(left.filter((n) => !n.endsWith('.mp4')), []);
-    assert.equal(left.length, 2);
-    assert.equal(left.includes(path.basename(original.path)), false);
-    for (const name of left) assert.equal(fs.statSync(path.join(volume, name)).size, 512);
-  } finally {
-    server.closeAllConnections?.();
-    server.close();
-    fs.rmSync(volume, { recursive: true, force: true });
-    fs.rmSync(work, { recursive: true, force: true });
-  }
-});
-
 test('a failed stitch job still drops the original; a matrix-only upload source stays', async () => {
   const { server } = await serve(1024);
   const volume = tmp();
