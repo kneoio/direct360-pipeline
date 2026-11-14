@@ -338,3 +338,38 @@ test('a part input is downloaded once per worker and reused by the next part', a
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('with D360_SOURCE_CACHE_MAX_GB the cache keeps recent inputs up to the limit, least recently used out first', async () => {
+  const size = 1024 * 1024;
+  const { server, stats } = await slowServer(size, 50 * 1024 * 1024);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-cache-'));
+  process.env.D360_SOURCE_CACHE_MAX_GB = String((2.5 * size) / 1024 ** 3); // two inputs beside the current one
+  try {
+    const { port } = server.address();
+    const url = (name) => `http://127.0.0.1:${port}/footage/${name}.mp4`;
+    const get = async (name) => {
+      const got = await cachedSource(url(name), { dir });
+      got.release();
+      return got;
+    };
+    const a = await get('a');
+    await new Promise((r) => setTimeout(r, 20));
+    const b = await get('b');
+    await new Promise((r) => setTimeout(r, 20));
+    const c = await get('c');
+    assert.ok(fs.existsSync(a.path) && fs.existsSync(b.path) && fs.existsSync(c.path));
+    await new Promise((r) => setTimeout(r, 20));
+    const bodies = stats.bodies;
+    assert.equal((await get('a')).download.cached, true); // a is now the most recently used
+    assert.equal(stats.bodies, bodies);
+    await new Promise((r) => setTimeout(r, 20));
+    await get('d'); // b is the oldest: it goes
+    assert.equal(fs.existsSync(b.path), false);
+    assert.ok(fs.existsSync(a.path) && fs.existsSync(c.path));
+  } finally {
+    delete process.env.D360_SOURCE_CACHE_MAX_GB;
+    server.closeAllConnections?.();
+    server.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -395,6 +395,35 @@ export function sourceCacheDir(env = process.env) {
   return env.D360_SOURCE_CACHE_DIR || path.join(os.tmpdir(), 'd360-source-cache');
 }
 
+/**
+ * How many bytes of inputs the source cache keeps besides the one a job is
+ * using: D360_SOURCE_CACHE_MAX_GB (the Helper Agent sets it, so footage edited
+ * again on the same computer is not downloaded again), else 0 (RunPod: only
+ * the current input).
+ */
+export function sourceCacheMaxBytes(env = process.env) {
+  const gb = Number(env.D360_SOURCE_CACHE_MAX_GB);
+  return Number.isFinite(gb) && gb > 0 ? gb * 1024 ** 3 : 0;
+}
+
+/** Removes the least recently used inputs (and stray files) until the rest fits in `max` bytes beside `keep`. */
+function evictSources(dir, keep, max) {
+  const kept = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (name === 'lock' || name.startsWith(keep)) continue;
+    const file = path.join(dir, name);
+    const st = fs.statSync(file);
+    if (/^[0-9a-f]{24}\.mp4$/.test(name) && st.isFile()) kept.push({ file, size: st.size, used: st.mtimeMs });
+    else fs.rmSync(file, { recursive: true, force: true });
+  }
+  kept.sort((a, b) => b.used - a.used);
+  let total = 0;
+  for (const k of kept) {
+    total += k.size;
+    if (total > max) fs.rmSync(k.file, { force: true });
+  }
+}
+
 function pidAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -467,7 +496,8 @@ function cacheUploaded(file, upload, uploaded) {
 /**
  * Part jobs keep their input across jobs on a warm worker: a second part of
  * the same job (same object, size and ETag) reuses the file instead of
- * downloading it again. One input is kept; anything else in the cache is
+ * downloading it again. The cache keeps the most recently used inputs up to
+ * sourceCacheMaxBytes() (by default only the newest one); older ones are
  * removed before a new download. An interrupted download resumes from its
  * aria2c control file. RunPod runs one job per worker; if another live
  * process holds the cache anyway, this job downloads to `fallback` instead.
@@ -515,13 +545,13 @@ async function cachedSourceInner(url, { dir = sourceCacheDir(), fallback = null,
       .slice(0, 24);
     const file = path.join(dir, `${id}.mp4`);
     if (fs.existsSync(file) && fs.statSync(file).size === info.size) {
-      log(`source reused from this worker's cache (${info.size} bytes)`);
+      const now = new Date();
+      fs.utimesSync(file, now, now); // most recently used: evicted last
+      log(`source reused from this computer's cache (${info.size} bytes)`);
       report({ phase: 'download', progress: 100 });
       return { path: file, download: { bytes: info.size, seconds: 0, mbps: null, connections: 0, restarts: 0, cached: true }, release: unlock };
     }
-    for (const name of fs.readdirSync(dir)) {
-      if (name !== 'lock' && !name.startsWith(id)) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
-    }
+    evictSources(dir, id, sourceCacheMaxBytes());
     const partial = `${file}.part`;
     const download = await fetchSource(url, partial, { expected: info.size, watch });
     fs.renameSync(partial, file);
@@ -1174,11 +1204,13 @@ async function main() {
     // Every task downloads its input to local disk first (aria2c, several
     // connections) and processes from there; ffmpeg never reads it over
     // HTTP. A part job keeps the file in this worker's cache, so another
-    // part of the same job landing here reuses it.
+    // part of the same job landing here reuses it; on the Helper Agent
+    // (D360_SOURCE_CACHE_MAX_GB) every job does, so the next job on the same
+    // footage skips the download.
     const partJob = uploadPartJob || Array.isArray(chunk_range);
     let src;
     let download;
-    if (partJob || volumeCacheDir()) {
+    if (partJob || volumeCacheDir() || sourceCacheMaxBytes() > 0) {
       const cached = await cachedSource(source_url, { fallback: path.join(dir, 'source.mp4') });
       releaseCache = cached.release;
       ({ path: src, download } = cached);
