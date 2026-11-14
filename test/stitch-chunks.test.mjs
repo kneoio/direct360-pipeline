@@ -6,7 +6,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { eacToEquirectFilter, stitchGopro, stitchPreset, stitchEngine, gpuStitchCq } from 'direct360-pipeline/src/gopro.js';
 import { chunkMinSeconds, containerLimits, planChunks } from 'direct360-pipeline/src/edl.js';
-import { buildMatrix, MATRIX_FPS } from 'direct360-pipeline/src/matrix.js';
 
 test('stitch preset is veryfast unless D360_STITCH_PRESET names an x264 preset', () => {
   assert.equal(stitchPreset({}), 'veryfast');
@@ -99,52 +98,6 @@ test('chunked stitch keeps the source frame count and puts an IDR on every chunk
     else process.env.D360_CHUNK_MIN_SEC = previous.chunk;
     if (previous.parallel == null) delete process.env.D360_MAX_PARALLEL;
     else process.env.D360_MAX_PARALLEL = previous.parallel;
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test('matrix and proxy keep frame count, size, and audio', { timeout: 120000 }, async () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-matrix-test-'));
-  try {
-    const src = path.join(tmp, 'equirect.mp4');
-    ffmpeg([
-      '-f', 'lavfi', '-i', 'testsrc2=size=640x320:rate=30:duration=2',
-      '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p',
-      '-c:a', 'aac', '-shortest', src,
-    ]);
-    const grid = path.join(tmp, 'grid.mp4');
-    const proxy = path.join(tmp, 'proxy.mp4');
-    await buildMatrix(src, grid, { grid: '3x7', format: 'youtube', proxyOut: proxy });
-    const gridFrames = Number(JSON.parse(ffprobe([
-      '-count_packets', '-select_streams', 'v:0',
-      '-show_entries', 'stream=nb_read_packets',
-      '-of', 'json', grid,
-    ])).streams[0].nb_read_packets);
-    const proxyInfo = JSON.parse(ffprobe([
-      '-count_packets', '-select_streams', 'v:0',
-      '-show_entries', 'stream=nb_read_packets,width,height',
-      '-show_entries', 'format=duration',
-      '-of', 'json', proxy,
-    ]));
-    // A 30 fps source plays at its own rate, up to the cap.
-    assert.equal(gridFrames, Math.round(2 * Math.min(30, MATRIX_FPS)));
-    assert.equal(Number(proxyInfo.streams[0].nb_read_packets), 60);
-    assert.equal(proxyInfo.streams[0].width, 2048);
-    assert.equal(proxyInfo.streams[0].height, 1024);
-    assert.ok(Math.abs(Number(proxyInfo.format.duration) - 2) < 1.5 / 30);
-    const audio = JSON.parse(ffprobe([
-      '-show_entries', 'stream=codec_type,codec_name',
-      '-of', 'json', proxy,
-    ])).streams;
-    assert.ok(audio.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
-    const gridKeys = ffprobe([
-      '-select_streams', 'v:0',
-      '-show_entries', 'frame=key_frame',
-      '-of', 'csv=p=0', grid,
-    ]).trim().split('\n').map((line) => line.split(',')[0]);
-    assert.equal(gridKeys[0], '1');
-  } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

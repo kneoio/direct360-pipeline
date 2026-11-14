@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fieldOfView } from 'direct360-pipeline/src/formats.js';
-import { buildMatrix, layoutFovs, layoutRolls, matrixCellSize, sanitizeLayouts } from 'direct360-pipeline/src/matrix.js';
+import { layoutFovs, layoutRolls, sanitizeLayouts } from 'direct360-pipeline/src/matrix.js';
 import {
   chunkCost, panFieldOfView, panPose, planChunks, planSegments, renderFromEdl, resolveView, stabilizedCommands,
 } from 'direct360-pipeline/src/edl.js';
@@ -243,37 +243,9 @@ async function withTemp(name, run) {
   }
 }
 
-test('a camera with roll 30: its matrix cell and its hold match a v360 with roll=30', { timeout: 180000 }, async () => {
+test('a camera with roll 30: its hold matches a v360 with roll=30', { timeout: 180000 }, async () => {
   await withTemp('d360-roll-', async (tmp) => {
     const src = makeSource(tmp, 2);
-
-    // Matrix cell. Camera 2 sits in the right cell, rolled 30° and zoomed to 80°.
-    const grid = path.join(tmp, 'grid.mp4');
-    const { cw, ch } = matrixCellSize(1, 2, 'youtube');
-    await buildMatrix(src, grid, {
-      grid: '2x1', format: 'youtube', yaws: [0, 20], pitches: [0, 5], rolls: [0, 30], fovs: [100, 80], fps: 12,
-    });
-    const cell = fieldOfView(cw, ch, 80);
-    const noLabel = `${cw - 40}:${ch - 50}:${cw + 40}:50`; // right cell, clear of the number
-    const wantCell = path.join(tmp, 'want-cell.png');
-    ffmpeg([
-      '-i', src, '-frames:v', '1',
-      '-vf', `v360=input=e:output=flat:yaw=20:pitch=5:roll=30:h_fov=${cell.hfov}:v_fov=${cell.vfov}:w=${cw}:h=${ch},crop=${cw - 40}:${ch - 50}:40:50`,
-      wantCell,
-    ]);
-    const gotCell = path.join(tmp, 'got-cell.png');
-    frameOf(grid, gotCell, 3, noLabel);
-    const matrixPsnr = psnrOf(wantCell, gotCell);
-    assert.ok(matrixPsnr >= 35, `matrix cell PSNR ${matrixPsnr}`);
-
-    // Rolling really changed the picture: the unrolled cell would not pass.
-    const unrolled = path.join(tmp, 'unrolled-cell.png');
-    ffmpeg([
-      '-i', src, '-frames:v', '1',
-      '-vf', `v360=input=e:output=flat:yaw=20:pitch=5:roll=0:h_fov=${cell.hfov}:v_fov=${cell.vfov}:w=${cw}:h=${ch},crop=${cw - 40}:${ch - 50}:40:50`,
-      unrolled,
-    ]);
-    assert.ok(psnrOf(unrolled, gotCell) < 30, 'the roll made no difference to the cell');
 
     // Hold render of the same camera.
     const out = path.join(tmp, 'hold.mp4');
@@ -307,12 +279,6 @@ test('layouts without rolls and fovs render exactly as they did, and spelled-out
     await renderFromEdl(src, same, edl, { ...common, rolls: [0, 0], fovs: [100, 100] });
     assert.equal(frameCount(old), 60);
     assert.equal(psnrOf(old, same), Infinity);
-
-    const gridOld = path.join(tmp, 'grid-old.mp4');
-    const gridSame = path.join(tmp, 'grid-same.mp4');
-    await buildMatrix(src, gridOld, { grid: '2x1', format: 'youtube', yaws: [0, 30], pitches: [0, 6], fps: 12 });
-    await buildMatrix(src, gridSame, { grid: '2x1', format: 'youtube', yaws: [0, 30], pitches: [0, 6], rolls: [0, 0], fovs: [100, 100], fps: 12 });
-    assert.equal(psnrOf(gridOld, gridSame), Infinity);
 
     // And the hold itself is the plain v360 it always was.
     const want = path.join(tmp, 'want.png');

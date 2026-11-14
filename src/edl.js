@@ -1084,22 +1084,6 @@ export function splitFrameRange(totalFrames, fps, workers) {
   return bounds.slice(0, -1).map((start, i) => ({ startFrame: start, frames: bounds[i + 1] - start }));
 }
 
-/**
- * The matrix output's own frame count for a part, given the part's
- * source-frame range. `fps=matrixFps` resamples to the nearest tick; this
- * computes that same nearest-tick count once, here, so the server (telling
- * the worker what to expect) and the worker (verifying what it produced via
- * `-frames:v`) always agree exactly — never left for ffmpeg to discover on
- * its own. Summing this over every part from `splitFrameRange` equals
- * calling it once over the whole clip (0, totalFrames).
- */
-export function matrixFrameCount(startFrame, frames, fps, matrixFps) {
-  const rate = Number(fps) > 0 ? Number(fps) : 30;
-  const from = Math.round((Number(startFrame) / rate) * matrixFps);
-  const to = Math.round(((Number(startFrame) + Number(frames)) / rate) * matrixFps);
-  return Math.max(1, to - from);
-}
-
 /** Same mark the old full-file pass used: 22% of the width, 3% margin, 60% opacity, bottom-right. */
 function watermarkOverlay(width, height, base) {
   const wmW = Math.max(2, Math.round(width * 0.22) & ~1);

@@ -7,7 +7,7 @@ import path from 'node:path';
 import {
   FOV_RANGES, PROJECTIONS, clampFov, fieldOfView, panniniSide, projectedFieldOfView, projectionOf, projectionStage,
 } from 'direct360-pipeline/src/formats.js';
-import { buildMatrix, layoutFovs, layoutProjections, sanitizeLayouts } from 'direct360-pipeline/src/matrix.js';
+import { layoutFovs, layoutProjections, sanitizeLayouts } from 'direct360-pipeline/src/matrix.js';
 import { panFieldOfView, planChunks, planSegments, renderFromEdl, resolveView } from 'direct360-pipeline/src/edl.js';
 
 const youtubeLayout = (extra = {}) => ({
@@ -187,11 +187,6 @@ test('the hold filter carries the output of each projection; flat is the string 
     await renderFromEdl(src, old, edl, two);
     await renderFromEdl(src, spelled, edl, { ...two, projections: ['flat', 'flat'] });
     assert.equal(psnrOf(old, spelled), Infinity);
-    const matrixOld = path.join(tmp, 'm-old.mp4');
-    const matrixSame = path.join(tmp, 'm-same.mp4');
-    await buildMatrix(src, matrixOld, { grid: '2x1', format: 'youtube', yaws: [0, 30], pitches: [0, 6], fps: 12 });
-    await buildMatrix(src, matrixSame, { grid: '2x1', format: 'youtube', yaws: [0, 30], pitches: [0, 6], projections: ['flat', 'flat'], fps: 12 });
-    assert.equal(psnrOf(matrixOld, matrixSame), Infinity);
   });
 });
 

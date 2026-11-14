@@ -271,7 +271,7 @@ function runGpuStitch(src, out, cq, frames, { signal, onProgress }) {
   });
 }
 
-/** The whole clip on the GPU, then the audio muxed in. It has no part ranges, so the upload fan-out must be off. */
+/** The whole clip on the GPU, then the audio muxed in. */
 async function stitchGoproGpu(src, out, { info, front, audio, clipFrames, clipDuration, fps, onProgress, signal, log }) {
   const cq = gpuStitchCq();
   fs.mkdirSync(path.dirname(out), { recursive: true });
@@ -311,32 +311,15 @@ async function stitchGoproGpu(src, out, { info, front, audio, clipFrames, clipDu
 }
 
 /**
- * Stitch a GoPro `.360` into one 2:1 equirectangular MP4, or one `partRange`
- * of it (a contiguous `{startFrame, frames}` slice, used by the upload
- * fan-out — see `src/edl.js`'s `splitFrameRange`). A part's own seeks are
- * shifted by `partRange.startFrame`; the intra-clip chunking below (its own,
- * finer-grained, multi-core parallelism) is otherwise unaware a part range
- * exists, since it is handed `partFrames` as if that were the whole clip.
+ * Stitch a GoPro `.360` into one 2:1 equirectangular MP4, its audio copied or encoded.
  *
- * The clip (or part) is split into time chunks (same planner as a render:
+ * The clip is split into time chunks (same planner as a render:
  * `D360_CHUNK_MIN_SEC`, at least one wave of cores). Each chunk seeks both
  * lenses, runs the same filter for the same frame count, and starts on an
  * IDR. The join is `concat -c copy`. `+faststart` is applied on that final
  * file only.
- *
- * `includeAudio` (default true) copies or encodes the **full original
- * clip's** audio once, regardless of `partRange` — the upload fan-out only
- * asks for this on one part, and reuses that one file when joining both the
- * stitched source and the proxy, muxing it in at join time rather than
- * per-part. When `partRange` is set, that full-clip audio is deliberately
- * **not** muxed into this part's own `out` (its video only covers this
- * part's own, shorter, frame range — muxing in the whole clip's audio would
- * desync them); it's written to `audioOut` instead, for the caller to
- * upload as its own standalone artifact. A whole-file call (`partRange`
- * null) ignores `audioOut` and keeps today's behavior: audio muxed directly
- * into `out`.
  */
-export async function stitchGopro(src, out, { onProgress, signal, log, partRange = null, includeAudio = true, audioOut = null } = {}) {
+export async function stitchGopro(src, out, { onProgress, signal, log } = {}) {
   const info = await probe(src);
   const footage = describeFootage(info);
   if (footage.kind !== 'gopro') throw new Error(footage.error || 'not a GoPro MAX .360 file');
@@ -347,24 +330,16 @@ export async function stitchGopro(src, out, { onProgress, signal, log, partRange
   if (backTiming.frames !== totalFrames) {
     throw new Error(`GoPro lenses have ${totalFrames} and ${backTiming.frames} frames`);
   }
-  const partStart = partRange ? Math.max(0, Math.trunc(partRange.startFrame)) : 0;
-  const clipFrames = partRange ? Math.max(1, Math.trunc(partRange.frames)) : totalFrames;
-  const clipDuration = partRange ? (clipFrames * den) / num : duration;
-  const audio = includeAudio && (info.streams || []).find((s) => s.codec_type === 'audio');
+  const audio = (info.streams || []).find((s) => s.codec_type === 'audio');
   const seekOrigin = seekOriginSec(front, info.format);
-  // A ranged part job's `src` is a remote URL (no local file to stat) — the
-  // disk-space estimate below falls back to the `lensBytes` (bit_rate-based)
-  // estimate in that case, same as when probing a local file's bit_rate works.
-  const srcBytes = /^https?:\/\//i.test(String(src)) ? 0 : fs.statSync(src).size;
-  const framesFraction = clipFrames / totalFrames;
-  const lensBytes = Math.max(mediaBytes(front, clipDuration), mediaBytes(back, clipDuration));
-  const stitchedBytes = lensBytes > 0 ? lensBytes : srcBytes * framesFraction;
+  const srcBytes = fs.statSync(src).size;
+  const lensBytes = Math.max(mediaBytes(front, duration), mediaBytes(back, duration));
+  const stitchedBytes = lensBytes > 0 ? lensBytes : srcBytes;
   const audioBytes = audio ? (mediaBytes(audio, duration) || Math.ceil((192000 / 8) * duration)) : 0;
   requireFreeDisk(os.tmpdir(), stitchWorkBytes({ stitchedBytes, audioBytes }));
   if (stitchEngine() === 'gpu') {
-    if (partRange) throw new Error('the GPU stitch has no part ranges: set DIRECT360_STITCH_FANOUT_MIN_SEC above the longest clip');
     return stitchGoproGpu(src, out, {
-      info: { duration }, front, audio, clipFrames, clipDuration, fps: num / den, onProgress, signal, log,
+      info: { duration }, front, audio, clipFrames: totalFrames, clipDuration: duration, fps: num / den, onProgress, signal, log,
     });
   }
   const preset = stitchPreset();
@@ -384,14 +359,14 @@ export async function stitchGopro(src, out, { onProgress, signal, log, partRange
   // it so a 32 GB container starts two copies, not seven.
   const stitchHeavy = Math.round(plan.heavy * 2.5);
   const stitchSlots = Math.max(1, Math.min(plan.processCap, Math.floor(plan.budget / stitchHeavy) || 1));
-  const chunkSec = chunkMinSeconds(clipDuration, plan.cpus);
+  const chunkSec = chunkMinSeconds(duration, plan.cpus);
   const chunks = planChunks(
-    [{ type: 'hold', start: 0, dur: clipDuration }],
-    { totalFrames: clipFrames, fps: num / den, chunkSeconds: chunkSec },
+    [{ type: 'hold', start: 0, dur: duration }],
+    { totalFrames: totalFrames, fps: num / den, chunkSeconds: chunkSec },
   );
   const gb = (n) => (n / 1024 ** 3).toFixed(2);
   log?.(`${plan.cpus} cpus, ${gb(plan.mem)} GB memory, budget ${gb(plan.budget)} GB, heavy ${gb(stitchHeavy)} GB → ${stitchSlots} ffmpeg`);
-  log?.(`stitch preset ${preset} crf ${STITCH_CRF}, chunk length ${chunkSec.toFixed(2)}s, ${chunks.length} chunks, ${clipFrames} frames${partRange ? ` (part at frame ${partStart})` : ''}`);
+  log?.(`stitch preset ${preset} crf ${STITCH_CRF}, chunk length ${chunkSec.toFixed(2)}s, ${chunks.length} chunks, ${totalFrames} frames`);
 
   fs.mkdirSync(path.dirname(out), { recursive: true });
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-stitch-'));
@@ -465,7 +440,7 @@ export async function stitchGopro(src, out, { onProgress, signal, log, partRange
         if (pass.signal.aborted) throw stoppedError();
         const threads = heavyThreadCount(plan.cpus, slots);
         const file = path.join(tmp, `chunk-${String(i).padStart(3, '0')}.mp4`);
-        const seek = seekTimestamp(partStart + seg.seekFrame, num, den, seekOrigin);
+        const seek = seekTimestamp(seg.seekFrame, num, den, seekOrigin);
         const filter = eacToEquirectFilter(front.index, back.index, footage.profile, seg.frames);
         const args = stitchVideoArgs({
           threads, preset, num, den, frames: seg.frames, filter, src, seek, out: file,
@@ -502,24 +477,20 @@ export async function stitchGopro(src, out, { onProgress, signal, log, partRange
     }
     let step = Date.now();
     peak = Math.max(peak, 1);
-    // A part's own output never gets the full-clip audio muxed in directly
-    // (see the doc comment above) — it goes to `audioOut` instead.
-    const muxAudioFile = partRange ? null : audioFile;
-    await run(FFMPEG, concatFaststartArgs({ listFile, audioFile: muxAudioFile, out }), { signal: encodePass?.signal });
+    await run(FFMPEG, concatFaststartArgs({ listFile, audioFile, out }), { signal: encodePass?.signal });
     encodePass?.release();
     encodePass = null;
-    if (partRange && audioFile && audioOut) fs.copyFileSync(audioFile, audioOut);
     const concatMs = Date.now() - step;
     log?.(`concat + faststart in ${(concatMs / 1000).toFixed(1)}s`);
     step = Date.now();
-    await assertOutputVideo(out, { frames: clipFrames, duration: clipDuration, fps: num / den, what: partRange ? 'stitch part' : 'stitch' });
+    await assertOutputVideo(out, { frames: totalFrames, duration: duration, fps: num / den, what: 'stitch' });
     log?.(`frame check in ${((Date.now() - step) / 1000).toFixed(1)}s`);
     watch.note();
     for (const file of files) fs.rmSync(file, { force: true });
     fs.rmSync(listFile, { force: true });
     return {
       file: out,
-      frames: clipFrames,
+      frames: totalFrames,
       chunks: chunks.length,
       preset,
       crf: STITCH_CRF,

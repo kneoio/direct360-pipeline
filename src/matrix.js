@@ -1,56 +1,14 @@
 /**
- * "Camera matrix" — reproject one equirectangular clip through N fixed
- * virtual-camera angles at once, tiled into a single grid video with each
- * cell numbered. It's a POC scouting tool: instead of guessing one yaw for
- * `reframe`, watch every candidate angle simultaneously and see which ones
- * are actually worth using (and which sit on the dual-fisheye stitch seam —
- * see README's "Stitch seams" note under reframe).
- *
- * A later, separate tool is meant to let someone scrub this grid's timeline
- * and record which camera number should be "live" at each moment — that
- * recording (an edit decision list) is what would drive a real cut. This
- * module only builds the grid; it doesn't consume or produce an EDL.
+ * Camera layouts (aims, names, colours, shapes per format) and the preview proxies a footage plays in the editor: the
+ * 360° equirect proxy every camera is drawn from live, and a flat video's proxy.
  */
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { run, FFMPEG, probe } from './encoder.js';
 import { containerLimits } from './edl.js';
-import { sendcmdScript, viewAngles } from './stabilize.js';
-import { filterPath } from './overlayFilter.js';
-import { videoTiming, seekTimestamp, seekOriginSec, reconnectArgs } from './ffmpegTools.js';
-import { FORMATS, getFormat, ROLL_LIMIT, FOV_RANGES, BULGE_SIDES, bulgeOf, hasBulge, clampFov, projectedFieldOfView, projectionOf, projectionStage } from './formats.js';
+import { videoTiming, reconnectArgs } from './ffmpegTools.js';
+import { FORMATS, getFormat, ROLL_LIMIT, FOV_RANGES, BULGE_SIDES, bulgeOf, hasBulge, clampFov, projectionOf } from './formats.js';
 import { flatProxySize } from './flatCameras.js';
-
-/**
- * ffmpeg args for an optional part range: `-ss` (half-frame-early, shared
- * convention) before `-i`, and `-to` after, wide enough to cover every
- * mapped output's frame cap (native-fps proxy/grid frames, plus one frame
- * of slack) — the actual frame-exact stop is the `-frames:v` cap on each
- * mapped output, not this window. `seekOrigin` is the video-stream-minus-
- * container start offset (`seekOriginSec`), already computed by the caller.
- *
- * `-copyts` is required here: without it, ffmpeg rebases output timestamps
- * to start near zero at the seek point, which desyncs the `fps=matrixFps`
- * resampling filter's tick boundaries from where a continuous whole-file
- * decode would place them (verified empirically — frame *count* still
- * matched without it, but frame *content* at nearly every tick did not,
- * since the filter was resampling a different point in time than the
- * matching tick of a continuous decode). With `-copyts`, the seeked
- * stream's timestamps stay absolute, so a boundary already aligned to a
- * whole second (see `splitFrameRange`) lines up with the exact same
- * `fps=` tick the whole-file decode would have produced. `-to` (an
- * absolute end timestamp), not `-t` (a relative duration), is required
- * once `-copyts` is in effect — `-t` is measured from the copied
- * (pre-seek) origin and so cuts off almost immediately.
- */
-function partRangeArgs(partRange, seekOrigin, fpsNum, fpsDen) {
-  if (!partRange) return { before: [], after: [] };
-  const startSec = Math.max(0, (Number(partRange.startFrame) - 0.5) / (fpsNum / fpsDen) + seekOrigin);
-  const seek = seekTimestamp(partRange.startFrame, fpsNum, fpsDen, seekOrigin);
-  const endSec = startSec + ((Math.max(1, Number(partRange.frames)) + 1) * fpsDen) / fpsNum;
-  return { before: ['-copyts', '-ss', seek], after: ['-to', endSec.toFixed(6)] };
-}
 
 /** Parse "5x5" / "4x6" into {rows, cols, n}. */
 export function parseGrid(spec) {
@@ -316,34 +274,6 @@ export function gridYaws(rows, cols, format = 'youtube') {
   return gridAims(rows, cols, format).yaws;
 }
 
-/**
- * Cell size for the scouting grid. This video is only played in the browser
- * (final renders read the original source; previews read the stored proxy
- * when the footage has one), so a cell's long side stays within 320px and
- * the whole grid within 1280px — enough to tell cameras apart, small enough
- * to scrub. Even dimensions throughout, as yuv420p requires.
- */
-export function matrixCellSize(rows, cols, format) {
-  const [aw, ah] = getFormat(format).aspect;
-  let scale = Math.floor(Math.min(320 / Math.max(aw, ah), 1280 / (cols * aw), 1280 / (rows * ah)));
-  scale -= scale % 2;
-  if (scale < 2) scale = 2;
-  return { cw: aw * scale, ch: ah * scale };
-}
-
-// Cells carry no burned-in number: the editor draws each camera's name over its cell, so it can follow the cut
-// (an adjusted shot is 6·1) and a name the user gave the camera.
-
-/**
- * The camera matrix plays at the source's own frame rate up to this cap. At 12 it looked choppy on phones; the source's
- * 25 fps cost 6% more bytes and about 1% more upload processing on a 31 s GoPro clip.
- */
-export const MATRIX_FPS = 30;
-/**
- * What a worker builds when the job does not name a cap (`maxFps`): a job from a server older than the 30 cap, which
- * counts a part's frames at 12.
- */
-export const LEGACY_MATRIX_FPS = 12;
 export const MATRIX_PROXY_WIDTH = 2048;
 
 /**
@@ -363,41 +293,6 @@ export function proxyVideoArgs(gop, fps) {
   ];
 }
 
-/**
- * The matrix grid's actual output frame rate for a source at `srcFps` —
- * never above `MATRIX_FPS`. The upload fan-out orchestrator (editorServer.js)
- * and the worker both need this exact value (not just the `MATRIX_FPS`
- * constant) to compute a part's expected matrix frame count via
- * `matrixFrameCount` (src/edl.js) the same way `buildMatrix` derives it
- * internally.
- */
-export function effectiveMatrixFps(srcFps) {
-  return Math.min(Math.round(Number(srcFps) || MATRIX_FPS), MATRIX_FPS);
-}
-
-/**
- * Build the grid video. Returns {file, grid, yaws, pitches, layout, width, height}.
- *
- * A browser proxy, not a master: the equirect is scaled down before the
- * cameras are projected, frames are capped at `MATRIX_FPS`, and a keyframe lands
- * every half second so timeline seeks and playhead drags don't decode a long GOP. Blind cells
- * (layout null) are solid black, except the two named in `lenses`
- * ({front, back} cell indexes): those show that whole lens as a 180° fisheye
- * square centered in the cell.
- *
- * `proxyOut`, when set, is a 2048×1024 H.264 equirect (see proxyVideoArgs) written from the same
- * decode as the grid (the decoded frames are split). It keeps the source
- * frame rate as an exact fraction so preview pans and holds share a
- * time_base. One proxy per footage: callers skip `proxyOut` when that file
- * is already stored. Time-chunking this pass was slower than one ffmpeg
- * (the grid is already a short encode), so matrix and proxy stay one graph.
- */
-/**
- * A normal (non-360) video has no camera matrix: one camera, the whole
- * frame. Only the preview proxy is built — the source scaled to
- * `flatProxySize`, aspect kept, source frame rate kept as an exact fraction
- * so previews share its time_base, audio copied (or encoded to AAC).
- */
 /**
  * The 360° preview proxy on its own: the equirect scaled to 2048×1024 (proxyVideoArgs), source frame rate as an exact
  * fraction, audio copied (or encoded to AAC). The editor plays this and draws every camera live from it, so a 360°
@@ -438,6 +333,12 @@ export async function buildEquirectProxy(src, proxyOut, { onProgress, signal, lo
   return { proxy: proxyOut, width: w, height: h, duration: timing.duration };
 }
 
+/**
+ * A normal (non-360) video has one camera, the whole
+ * frame. Only the preview proxy is built — the source scaled to
+ * `flatProxySize`, aspect kept, source frame rate kept as an exact fraction
+ * so previews share its time_base, audio copied (or encoded to AAC).
+ */
 export async function buildFlatProxy(src, proxyOut, { onProgress, signal, log } = {}) {
   if (!proxyOut) throw new Error('a flat proxy needs an output path');
   const info = await probe(src);
@@ -477,240 +378,4 @@ export async function buildFlatProxy(src, proxyOut, { onProgress, signal, log } 
   });
   log?.(`flat preview proxy ${proxy.w}x${proxy.h}, ${((Date.now() - started) / 1000).toFixed(1)}s`);
   return { proxy: proxyOut, width: proxy.w, height: proxy.h, duration: timing.duration };
-}
-
-export async function buildMatrix(src, out, {
-  grid = '3x2',
-  format = 'youtube',
-  yaws,
-  pitches,
-  rolls,
-  fovs,
-  projections,
-  bulges,
-  layout: layoutOpt,
-  lenses,
-  pitch = 0,
-  fov = 100,
-  fps,
-  maxFps = MATRIX_FPS,
-  proxyOut,
-  onProgress,
-  signal,
-  log,
-  partRange = null,
-  matrixFrames = null,
-  stabilization = null,
-} = {}) {
-  if (partRange && !(Number(matrixFrames) > 0)) throw new Error('a part range needs matrixFrames');
-  const { rows, cols, n } = parseGrid(grid);
-  let angles;
-  let cellPitches;
-  let layout; // per cell: 1-based camera number, or null for blind
-
-  if (yaws && yaws.length) {
-    if (layoutOpt && layoutOpt.length === n) {
-      layout = layoutOpt;
-      angles = yaws;
-      cellPitches = pitches && pitches.length === yaws.length ? pitches : yaws.map(() => pitch);
-    } else if (yaws.length === n) {
-      layout = Array.from({ length: n }, (_, i) => i + 1);
-      angles = yaws;
-      cellPitches = pitches && pitches.length === n ? pitches : yaws.map(() => pitch);
-    } else {
-      throw new Error(`--grid ${grid} needs ${n} yaws or a matching layout, got ${yaws.length} yaws`);
-    }
-  } else {
-    const aims = gridAims(rows, cols, format);
-    layout = aims.layout;
-    angles = aims.yaws;
-    cellPitches = aims.pitches;
-    lenses ??= aims.lenses;
-  }
-  // Cell index -> yaw of the lens shown there. Only blind cells can hold one.
-  const lensYaw = new Map();
-  for (const [cell, yaw] of [[lenses?.front, 0], [lenses?.back, 180]]) {
-    if (Number.isInteger(cell) && cell >= 0 && cell < n && layout[cell] == null) lensYaw.set(cell, yaw);
-  }
-  if (angles.length !== cellPitches.length) {
-    throw new Error(`yaw/pitch length mismatch: ${angles.length} vs ${cellPitches.length}`);
-  }
-  const active = layout
-    .map((cam, cell) => (cam == null ? null : { cell, cam: cam - 1 }))
-    .filter(Boolean);
-  // A camera the user removed has no cell, so fewer cells than angles is
-  // fine; a cell naming a camera with no angle is not.
-  if (!active.length || active.some(({ cam }) => cam < 0 || cam >= angles.length)) {
-    throw new Error(`layout has ${active.length} cameras but ${angles.length} yaw angles`);
-  }
-
-  const info = await probe(src);
-  const videoStream = info.streams.find((s) => s.codec_type === 'video');
-  if (!videoStream) throw new Error(`${src} has no video stream`);
-  const timing = videoTiming(videoStream);
-  const fpsNum = timing.num;
-  const fpsDen = timing.den;
-  const srcFps = Math.round(timing.fps);
-  const matrixFps = Math.min(fps || srcFps, maxFps);
-  const duration = timing.duration;
-  const audio = !partRange && info.streams.find((s) => s.codec_type === 'audio');
-
-  const { cw, ch } = matrixCellSize(rows, cols, format);
-  // Per camera, by camera index. A missing entry is the unrolled default view.
-  const rollOf = (cam) => (Number.isFinite(rolls?.[cam]) ? rolls[cam] : 0);
-  const projectionAt = (cam) => projectionOf(projections?.[cam]);
-  const fovValue = (cam) => (Number.isFinite(fovs?.[cam]) ? fovs[cam] : (projectionAt(cam) === 'flat' ? fov : FOV_RANGES[projectionAt(cam)].default));
-  const bulgeAt = (cam) => bulgeOf(bulges?.[cam]);
-  const fovOf = (cam) => projectedFieldOfView(cw, ch, fovValue(cam), projectionAt(cam), bulgeAt(cam));
-  const stageOf = (cam, i) => projectionStage(projectionAt(cam), cw, ch, fovValue(cam), bulgeAt(cam), `w${i}`);
-
-  // v360 samples the whole frame for every camera. A 320px cell only needs
-  // about 2K of equirect, so shrink first when the upload is larger.
-  // The stored preview proxy is that same 2048×1024 frame at the source
-  // frame rate. When both need the scale, it happens once and the decoded
-  // frames are split — the proxy is not a second pass over the file.
-  const proxyW = MATRIX_PROXY_WIDTH;
-  const proxyH = MATRIX_PROXY_WIDTH / 2;
-  const colorDur = Math.max(duration, 0.1);
-  const filters = [];
-  let gridInput = '[0:v]';
-  let shrink = videoStream.width > MATRIX_PROXY_WIDTH
-    ? `,scale=${proxyW}:${proxyH}:flags=bilinear`
-    : '';
-  if (proxyOut && videoStream.width > MATRIX_PROXY_WIDTH) {
-    filters.push(`[0:v]scale=${proxyW}:${proxyH}:flags=bilinear,format=yuv420p,split=2[proxy][vgrid]`);
-    gridInput = '[vgrid]';
-    shrink = '';
-  } else if (proxyOut) {
-    filters.push('[0:v]split=2[vproxy][vgrid]');
-    filters.push(`[vproxy]scale=${proxyW}:${proxyH}:flags=bilinear,format=yuv420p[proxy]`);
-    gridInput = '[vgrid]';
-  }
-  let stabDir = null;
-  const stabCells = new Map();
-  if (stabilization?.corrections?.length) {
-    // Matrix frame m shows the source frame nearest m / matrixFps; a part's
-    // first matrix frame is aligned to a whole source second.
-    const firstFrame = (partRange ? Number(partRange.startFrame) : 0) + (Number(stabilization.frameOffset) || 0);
-    const index0 = Math.round((firstFrame / (fpsNum / fpsDen)) * matrixFps);
-    const count = partRange ? Math.trunc(matrixFrames) : Math.ceil(duration * matrixFps) + 2;
-    stabDir = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-mstab-'));
-    active.forEach(({ cam }, i) => {
-      const per = viewAngles(stabilization.corrections, { yaw: angles[cam], pitch: cellPitches[cam], roll: rollOf(cam) });
-      const picked = Array.from({ length: count }, (_, j) => {
-        const f = Math.round(((index0 + j) / matrixFps) * (fpsNum / fpsDen));
-        return per[Math.max(0, Math.min(per.length - 1, f))];
-      });
-      const file = path.join(stabDir, `cell-${i}.cmd`);
-      fs.writeFileSync(file, sendcmdScript(picked, { fps: matrixFps, target: `v360@c${i}` }));
-      stabCells.set(i, { file, first: picked[0] });
-    });
-  }
-  const lensCells = [...lensYaw.keys()];
-  const lensSide = Math.min(cw, ch);
-  const splits = [...active.map((_, i) => `[s${i}]`), ...lensCells.map((cell) => `[l${cell}]`)];
-  if (splits.length) {
-    filters.push(`${gridInput}fps=${matrixFps}${shrink},split=${splits.length}${splits.join('')}`);
-    for (const cell of lensCells) {
-      filters.push(
-        `[l${cell}]v360=input=e:output=fisheye:yaw=${lensYaw.get(cell)}:pitch=0:roll=0:h_fov=180:v_fov=180:w=${lensSide}:h=${lensSide},`
-        + `pad=${cw}:${ch}:(ow-iw)/2:(oh-ih)/2:black[e${cell}]`
-      );
-    }
-    active.forEach(({ cam }, i) => {
-      const { hfov, vfov } = fovOf(cam);
-      const stage = stageOf(cam, i);
-      const crop = stage.post;
-      let v360 = `v360=input=e:output=${stage.output}:yaw=${angles[cam].toFixed(2)}:pitch=${cellPitches[cam].toFixed(2)}:roll=${rollOf(cam).toFixed(2)}:h_fov=${hfov}:v_fov=${vfov}:w=${stage.w}:h=${stage.h}${crop}`;
-      if (stabCells.has(i)) {
-        const { file, first } = stabCells.get(i);
-        v360 = `setpts=PTS-STARTPTS,sendcmd=f='${filterPath(file)}',v360@c${i}=input=e:output=${stage.output}:yaw=${first.yaw.toFixed(4)}:pitch=${first.pitch.toFixed(4)}:roll=${first.roll.toFixed(4)}:reset_rot=1:h_fov=${hfov}:v_fov=${vfov}:w=${stage.w}:h=${stage.h}${crop}`;
-      }
-      filters.push(`[s${i}]${v360}[a${i}]`);
-    });
-  }
-
-  const stackInputs = [];
-  let blind = 0;
-  for (let cell = 0; cell < n; cell++) {
-    if (lensYaw.has(cell)) {
-      stackInputs.push(`[e${cell}]`);
-    } else if (layout[cell] == null) {
-      filters.push(`color=c=black:s=${cw}x${ch}:r=${matrixFps}:d=${colorDur}[b${blind}]`);
-      stackInputs.push(`[b${blind}]`);
-      blind++;
-    } else {
-      const ai = active.findIndex((a) => a.cell === cell);
-      stackInputs.push(`[a${ai}]`);
-    }
-  }
-  const positions = Array.from({ length: n }, (_, cell) => `${(cell % cols) * cw}_${Math.floor(cell / cols) * ch}`).join('|');
-  filters.push(`${stackInputs.join('')}xstack=inputs=${n}:layout=${positions}[grid]`);
-
-  fs.mkdirSync(path.dirname(out), { recursive: true });
-  if (proxyOut) fs.mkdirSync(path.dirname(proxyOut), { recursive: true });
-  const proxyGop = Math.max(1, Math.round(fpsNum / fpsDen));
-  const filterThreads = Math.max(1, containerLimits().cpus);
-  const seekOrigin = seekOriginSec(videoStream, info.format);
-  const partArgs = partRangeArgs(partRange, seekOrigin, fpsNum, fpsDen);
-  const args = [
-    '-hide_banner', '-loglevel', 'error', '-y',
-    ...reconnectArgs(src),
-    ...partArgs.before,
-    '-i', src,
-    ...partArgs.after,
-    '-filter_complex_threads', String(filterThreads),
-    '-filter_complex', filters.join(';'),
-  ];
-  if (onProgress && duration) args.push('-progress', 'pipe:1');
-  if (proxyOut) {
-    args.push('-map', '[proxy]');
-    if (audio) args.push('-map', '0:a:0');
-    args.push(...proxyVideoArgs(proxyGop, `${fpsNum}/${fpsDen}`));
-    if (audio) args.push(...(audio.codec_name === 'aac' ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '160k']));
-    if (partRange) args.push('-frames:v', String(Math.trunc(partRange.frames)));
-    args.push('-movflags', '+faststart', proxyOut);
-  }
-  args.push(
-    '-map', '[grid]', '-an',
-    '-c:v', 'libx264', '-crf', '35', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-    // A keyframe every half second: a drag on the phone lands on a frame twice as fast as with one a second.
-    '-g', String(Math.round(matrixFps / 2)), '-keyint_min', String(Math.round(matrixFps / 2)),
-    '-x264-params', 'rc-lookahead=20:scenecut=0',
-    ...(partRange ? ['-frames:v', String(Math.trunc(matrixFrames))] : []),
-    '-movflags', '+faststart',
-    out,
-  );
-  const partStartSec = partRange ? partRange.startFrame / (fpsNum / fpsDen) : 0;
-  const partDurationSec = partRange ? partRange.frames / (fpsNum / fpsDen) : duration;
-  const started = Date.now();
-  try {
-  await run(FFMPEG, args, {
-    signal,
-    // `-copyts` keeps a part's reported `secs` absolute (it's not
-    // re-zeroed at the seek point), so progress is normalized against the
-    // part's own [start, start+duration) window rather than 0..duration.
-    onProgress: onProgress && partDurationSec
-      ? (secs) => onProgress(Math.min(1, Math.max(0, (secs - partStartSec) / partDurationSec)))
-      : undefined,
-  });
-  } finally {
-    if (stabDir) fs.rmSync(stabDir, { recursive: true, force: true });
-  }
-  log?.(`matrix and proxy in one ffmpeg, ${((Date.now() - started) / 1000).toFixed(1)}s`);
-  return {
-    file: out,
-    proxy: proxyOut || null,
-    grid: { rows, cols, n, cameras: angles.length },
-    yaws: angles,
-    pitches: cellPitches,
-    rolls: angles.map((_, cam) => rollOf(cam)),
-    fovs: angles.map((_, cam) => fovValue(cam)),
-    ...(angles.some((_, cam) => projectionAt(cam) !== 'flat') ? { projections: angles.map((_, cam) => projectionAt(cam)) } : {}),
-    ...(angles.some((_, cam) => hasBulge(bulgeAt(cam))) ? { bulges: angles.map((_, cam) => bulgeAt(cam)) } : {}),
-    layout,
-    lenses: lensYaw.size ? lenses : null,
-    width: cols * cw,
-    height: rows * ch,
-  };
 }

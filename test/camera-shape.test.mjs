@@ -7,7 +7,7 @@ import path from 'node:path';
 import {
   BULGE_REACH, bulgeOf, bulgeReach, bulgeWarp, fieldOfView, hasBulge, projectedFieldOfView, projectionStage, sameBulge,
 } from 'direct360-pipeline/src/formats.js';
-import { buildMatrix, layoutBulges, sanitizeLayouts } from 'direct360-pipeline/src/matrix.js';
+import { layoutBulges, sanitizeLayouts } from 'direct360-pipeline/src/matrix.js';
 import { planSegments, renderFromEdl, resolveView } from 'direct360-pipeline/src/edl.js';
 
 const youtubeLayout = (extra = {}) => ({
@@ -216,26 +216,6 @@ test('a final hold shows the bowed frame: each output pixel is the direction bul
     await renderFromEdl(src, zero, [{ t: 0, camera: 1 }], { ...common, bulges: [STRAIGHT] });
     assert.equal(psnrOf(old, zero), Infinity);
     assert.ok(psnrOf(old, bowed) < 35);
-  });
-});
-
-test('the matrix cell shows the same bowed frame as the final', { timeout: 240000 }, async () => {
-  await withTemp('d360-shape-matrix-', async (tmp) => {
-    const src = makeSource(tmp);
-    const out = path.join(tmp, 'matrix.mp4');
-    // Two cells side by side: camera 1 bowed on the left, camera 2 straight on the right.
-    const built = await buildMatrix(src, out, { grid: '2x1', format: 'youtube', yaws: [0, 90], pitches: [0, 0], bulges: [SHAPE, null], fps: 12 });
-    assert.deepEqual(built.bulges, [bulgeOf(SHAPE), STRAIGHT]);
-    const cellW = built.width / 2;
-    const png = path.join(tmp, 'matrix.png');
-    ffmpeg(['-i', out, '-vf', `select=eq(n\\,3),crop=${cellW}:${built.height}:0:0`, '-frames:v', '1', png]);
-    assertShows(png, cellW, built.height, fieldOfView(cellW, built.height, 100), 'matrix');
-    // A part of the matrix that starts late (copyts) still has the warp maps.
-    const part = path.join(tmp, 'part.mp4');
-    await buildMatrix(src, part, {
-      grid: '2x1', format: 'youtube', yaws: [0, 90], pitches: [0, 0], bulges: [SHAPE, null], fps: 12, partRange: { startFrame: 15, frames: 15 }, matrixFrames: 6,
-    });
-    assert.equal(frameCount(part), 6);
   });
 });
 

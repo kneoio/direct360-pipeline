@@ -1235,7 +1235,6 @@ async function main() {
       if (task === 'stitch_proxy') {
         media = path.join(dir, 'equirect.mp4');
         const stitchRun = await stats.timed('stitch', () => stitchGopro(src, media, {
-          includeAudio: true,
           onProgress: (frac) => report({ phase: 'stitch', progress: Math.round(frac * 100) }),
           log,
         }));
@@ -1265,7 +1264,6 @@ async function main() {
       // The stitch maps video and audio only, so the gpmd track is read from this download first.
       telemetryResult = await uploadTelemetry(src, telemetry_put, orientation_put);
       const stitchRun = await stats.timed('stitch', () => stitchGopro(src, out, {
-        includeAudio: true,
         onProgress: (frac) => report({ phase: 'stitch', progress: Math.round(frac * 100) }),
         log,
       }));
