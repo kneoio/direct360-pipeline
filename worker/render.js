@@ -262,12 +262,19 @@ function runAria2(url, dest, connections, watch, total = null) {
     let lastProgress = Date.now();
     let tailFrom = null;
     let tailAt = 0;
+    let shownPct = -1;
     child.stdout.on('data', (chunk) => {
       const got = aria2Completed(String(chunk));
       if (got == null) return;
       const now = Date.now();
       if (completed == null || got > completed) lastProgress = now;
       completed = got;
+      // The download's percentage for the app, once per whole percent (a resumed file starts where it stopped).
+      const pct = total ? Math.min(99, Math.floor((got / total) * 100)) : -1;
+      if (pct > shownPct) {
+        shownPct = pct;
+        report({ phase: 'download', progress: pct });
+      }
       if (total != null && tailFrom == null && got >= total - tailBytes(total)) {
         tailFrom = got;
         tailAt = now;

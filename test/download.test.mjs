@@ -373,3 +373,30 @@ test('with D360_SOURCE_CACHE_MAX_GB the cache keeps recent inputs up to the limi
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an aria2c download tells the app its percentage as it goes, not only 0 and 100', { skip: !hasAria2 && 'aria2c not installed', timeout: 60_000 }, async () => {
+  const size = 12 * 1024 * 1024;
+  const { server } = await slowServer(size, 3 * 1024 * 1024);
+  const dest = path.join(os.tmpdir(), `d360-pct-${Date.now()}.bin`);
+  const seen = [];
+  const write = console.error;
+  console.error = (line, ...rest) => {
+    const m = /^PROGRESS (.*)$/.exec(String(line));
+    if (m) seen.push(JSON.parse(m[1]));
+    else write(line, ...rest);
+  };
+  try {
+    const { port } = server.address();
+    await fetchSource(`http://127.0.0.1:${port}/footage/source.mp4`, dest);
+  } finally {
+    console.error = write;
+    server.closeAllConnections?.();
+    server.close();
+    fs.rmSync(dest, { force: true });
+  }
+  const pcts = seen.filter((p) => p.phase === 'download').map((p) => p.progress);
+  assert.equal(pcts[0], 0);
+  assert.equal(pcts.at(-1), 100);
+  assert.ok(pcts.some((p) => p > 0 && p < 100), `only ${pcts.join(', ')}`);
+  assert.deepEqual(pcts, [...pcts].sort((a, b) => a - b));
+});
