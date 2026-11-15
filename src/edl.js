@@ -590,31 +590,6 @@ export function createFfmpegLimiter({ budget, costs, maxParallel = null, signal,
   };
 }
 
-const round2 = (n) => Math.round(n * 100) / 100;
-
-/**
- * An entry's own camera settings (`view`), cleaned: only the parts that are usable, aims in range, the zoom inside the
- * projection's range. Null when nothing is left.
- */
-export function sanitizeView(raw) {
-  if (!raw || typeof raw !== 'object') return null;
-  const view = {};
-  const yaw = Number(raw.yaw);
-  if (raw.yaw != null && Number.isFinite(yaw)) view.yaw = round2(normalizeAngle(yaw));
-  const pitch = Number(raw.pitch);
-  if (raw.pitch != null && Number.isFinite(pitch)) view.pitch = round2(Math.min(90, Math.max(-90, pitch)));
-  const roll = Number(raw.roll);
-  if (raw.roll != null && Number.isFinite(roll)) view.roll = round2(normalizeAngle(roll));
-  if (raw.projection != null && FOV_RANGES[raw.projection]) view.projection = raw.projection;
-  const fov = Number(raw.fov);
-  if (raw.fov != null && Number.isFinite(fov)) {
-    const range = FOV_RANGES[view.projection ?? 'flat'];
-    // Without its own projection the zoom is held to the widest range that exists; the layout's projection decides at render time.
-    view.fov = round2(view.projection ? Math.min(range.max, Math.max(range.min, fov)) : Math.min(300, Math.max(FOV_RANGES.flat.min, fov)));
-  }
-  if (raw.bulge != null && typeof raw.bulge === 'object') view.bulge = bulgeOf(raw.bulge);
-  return Object.keys(view).length ? view : null;
-}
 
 /** Drop unusable keyframes and keep a strictly increasing `t`. Empty is allowed. */
 export function sanitizeEdl(edl, cameraCount) {
@@ -637,8 +612,6 @@ export function sanitizeEdl(edl, cameraCount) {
       const kind = sanitizePanKind(raw?.panKind);
       if (kind) entry.panKind = kind;
     }
-    const view = sanitizeView(raw?.view);
-    if (view) entry.view = view;
     cleaned.push(entry);
   }
   cleaned.sort((a, b) => a.t - b.t);
@@ -715,19 +688,17 @@ export function planSegments(edl, cameras, pitches, duration, flat = false, roll
   const projectionAt = (index) => projectionOf(projections?.[index]);
   const fovOf = (index) => (Number.isFinite(fovs?.[index]) ? fovs[index] : FOV_RANGES[projectionAt(index)].default);
   const bulgeAt = (index) => bulgeOf(bulges?.[index]);
-  // How an entry's camera is set: the footage's layout for it, with the entry's own `view` laid over.
+  // How an entry's camera is set: the footage's layout for it (every bar is its camera).
   const poseOf = (entry) => {
     const index = entry.camera - 1;
-    const v = entry.view || {};
-    const projection = v.projection ?? projectionAt(index);
     return {
       index,
-      yaw: Number.isFinite(v.yaw) ? v.yaw : cameras[index],
-      pitch: Number.isFinite(v.pitch) ? v.pitch : (pitches[index] ?? 0),
-      roll: Number.isFinite(v.roll) ? v.roll : rollOf(index),
-      fov: Number.isFinite(v.fov) ? v.fov : (v.projection ? FOV_RANGES[projection].default : fovOf(index)),
-      projection,
-      bulge: v.bulge ? bulgeOf(v.bulge) : bulgeAt(index),
+      yaw: cameras[index],
+      pitch: pitches[index] ?? 0,
+      roll: rollOf(index),
+      fov: fovOf(index),
+      projection: projectionAt(index),
+      bulge: bulgeAt(index),
     };
   };
   let cur = poseOf(edl[0]);
