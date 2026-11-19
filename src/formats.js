@@ -243,10 +243,34 @@ function bulgeRemap(bulge, { srcW, srcH, halfW, halfH, outW, outH, width, height
   // u right, v up, both -1..1 over the output's pixel centres.
   const u = `((2*X+1)/W-1)`;
   const v = `(1-(2*Y+1)/H)`;
-  const su = `${u}*(1+if(gte(${u},0),${k('right')},${k('left')})*(1-${v}*${v}))`;
-  const sv = `${v}*(1+if(gte(${v},0),${k('top')},${k('bottom')})*(1-${u}*${u}))`;
-  const xmap = `clip(floor(${n(srcW / 2)}+${su}*${n(halfW)}),0,${srcW - 1})`;
-  const ymap = `clip(floor(${n(srcH / 2)}-${sv}*${n(halfH)}),0,${srcH - 1})`;
+  let su = `${u}*(1+if(gte(${u},0),${k('right')},${k('left')})*(1-${v}*${v}))`;
+  let sv = `${v}*(1+if(gte(${v},0),${k('top')},${k('bottom')})*(1-${u}*${u}))`;
+  const suBows = su;
+  const svBows = sv;
+  // Corner moves, each fading to nothing at the other three corners.
+  (bulge?.corners ?? []).forEach((c, i) => {
+    const [cu, cv] = BULGE_CORNERS[i] ?? [];
+    if (cu == null) return;
+    const w = `(1+(${cu})*${u})*(1+(${cv})*${v})/4`;
+    if (Number(c?.[0])) su += `+(${n(c[0])})*${w}`;
+    if (Number(c?.[1])) sv += `+(${n(c[1])})*${w}`;
+  });
+  // Side middles slid along their sides.
+  const s = bulge?.shift;
+  if (s) {
+    const along = (pos, neg, a, b) => {
+      const parts = [];
+      if (Number(a)) parts.push(`max(${pos},0)*(${n(a)})`);
+      if (Number(b)) parts.push(`max(-${pos},0)*(${n(b)})`);
+      return parts.length ? `+(1-${neg}*${neg})*(${parts.join('+')})` : '';
+    };
+    su += along(v, u, s.top, s.bottom);
+    sv += along(u, v, s.right, s.left);
+  }
+  // A bows-only shape keeps its old expression; with added terms the sum is bracketed.
+  const group = (e, plain) => (e === plain ? e : `(${e})`);
+  const xmap = `clip(floor(${n(srcW / 2)}+${group(su, suBows)}*${n(halfW)}),0,${srcW - 1})`;
+  const ymap = `clip(floor(${n(srcH / 2)}-${group(sv, svBows)}*${n(halfH)}),0,${srcH - 1})`;
   const map = (expr) => `nullsrc=s=${outW}x${outH}:d=1,format=gray16le,geq=lum='${expr}',trim=end_frame=1,setpts=PTS-1000000/TB`;
   return `[${tag}v];${map(xmap)}[${tag}x];${map(ymap)}[${tag}y];`
     + `[${tag}v][${tag}x][${tag}y]remap=fill=black,scale=${width}:${height}:flags=area`;
@@ -265,41 +289,98 @@ export const BULGE_REACH = 0.5;
 /** A bowed view is drawn this many times larger, warped, then scaled down, so its edges stay smooth. */
 export const BULGE_SUPERSAMPLE = 2;
 
-/** A stored shape with every side a number in -1..1 (two decimals); a missing or broken side is 0. */
+/**
+ * The frame's corners and side middles can also be moved (as the web editor's
+ * lens.js does). `corners` moves each corner (top-left, top-right,
+ * bottom-right, bottom-left) by [du, dv] in frame units (1 is half the frame,
+ * u right, v up); `shift` slides each side's middle along its side (top and
+ * bottom: + is right; left and right: + is up). Each number is held within
+ * ±BULGE_PIN_MAX, three decimals.
+ */
+export const BULGE_CORNERS = [[-1, 1], [1, 1], [1, -1], [-1, -1]];
+export const BULGE_PIN_MAX = 0.75;
+
+const pin = (raw) => {
+  const v = Number(raw);
+  return Number.isFinite(v) ? Math.round(Math.min(BULGE_PIN_MAX, Math.max(-BULGE_PIN_MAX, v)) * 1000) / 1000 || 0 : 0;
+};
+
+/**
+ * A stored shape with every side a number in -1..1 (two decimals); a missing
+ * or broken side is 0. `shift` and `corners` are kept only when something in
+ * them is not 0.
+ */
 export function bulgeOf(value) {
   const out = {};
   for (const side of BULGE_SIDES) {
     const v = Number(value?.[side]);
-    out[side] = Number.isFinite(v) ? Math.round(Math.min(1, Math.max(-1, v)) * 100) / 100 : 0;
+    out[side] = Number.isFinite(v) ? Math.round(Math.min(1, Math.max(-1, v)) * 100) / 100 || 0 : 0;
   }
+  const shift = Object.fromEntries(BULGE_SIDES.map((side) => [side, pin(value?.shift?.[side])]));
+  if (BULGE_SIDES.some((side) => shift[side])) out.shift = shift;
+  const corners = BULGE_CORNERS.map((_, k) => [pin(value?.corners?.[k]?.[0]), pin(value?.corners?.[k]?.[1])]);
+  if (corners.some(([a, b]) => a || b)) out.corners = corners;
   return out;
 }
 
-/** True when some side of `bulge` bows. */
+/** True when some side of `bulge` bows or some corner or side middle moves. */
 export function hasBulge(bulge) {
-  return BULGE_SIDES.some((side) => Boolean(Number(bulge?.[side])));
+  const b = bulgeOf(bulge);
+  return BULGE_SIDES.some((side) => Boolean(b[side])) || !!b.shift || !!b.corners;
 }
 
-/** True when two shapes are the same (a missing side is 0). */
+/** True when two shapes are the same (anything missing is 0). */
 export function sameBulge(a, b) {
-  return BULGE_SIDES.every((side) => (Number(a?.[side]) || 0) === (Number(b?.[side]) || 0));
+  return JSON.stringify(bulgeOf(a)) === JSON.stringify(bulgeOf(b));
 }
 
 /**
- * The point of the straight frame that the bowed frame shows at (u, v): both
- * -1..1 across the frame, v up. The top side (v = 1) lands on
- * v = 1 + BULGE_REACH * top * (1 - u²), and so on round; the corners stay.
+ * The point of the straight frame that the shaped frame shows at (u, v):
+ * both -1..1 across the frame, v up. The bows push each side's middle out or
+ * in (the top side lands on v = 1 + BULGE_REACH * top * (1 - u²), and so on
+ * round); each corner's move spreads over the frame, fading to nothing at the
+ * other corners; a side's shift slides its middle along it, fading to nothing
+ * at its corners and at the frame's middle line.
  */
 export function bulgeWarp(bulge, u, v) {
   const kx = BULGE_REACH * (Number(u >= 0 ? bulge?.right : bulge?.left) || 0);
   const ky = BULGE_REACH * (Number(v >= 0 ? bulge?.top : bulge?.bottom) || 0);
-  return [u * (1 + kx * (1 - v * v)), v * (1 + ky * (1 - u * u))];
+  let x = u * (1 + kx * (1 - v * v));
+  let y = v * (1 + ky * (1 - u * u));
+  if (bulge?.corners) {
+    BULGE_CORNERS.forEach(([cu, cv], k) => {
+      const w = ((1 + u * cu) * (1 + v * cv)) / 4;
+      x += (Number(bulge.corners[k]?.[0]) || 0) * w;
+      y += (Number(bulge.corners[k]?.[1]) || 0) * w;
+    });
+  }
+  const s = bulge?.shift;
+  if (s) {
+    x += (1 - u * u) * (Math.max(v, 0) * (Number(s.top) || 0) + Math.max(-v, 0) * (Number(s.bottom) || 0));
+    y += (1 - v * v) * (Math.max(u, 0) * (Number(s.right) || 0) + Math.max(-u, 0) * (Number(s.left) || 0));
+  }
+  return [x, y];
 }
 
-/** How far out of the straight frame a bowed one reaches, per axis, in frame halves (1 = no further). */
+/** Points sampled per side of the frame's edge to find how far a shape reaches. */
+const REACH_SAMPLES = 64;
+
+/**
+ * How far out of the straight frame a shaped one reaches, per axis, in frame
+ * halves (1 = no further): the furthest |x| and |y| the frame's edge warps to.
+ */
 export function bulgeReach(bulge) {
-  const out = (...sides) => 1 + BULGE_REACH * Math.max(0, ...sides.map((side) => Number(bulge?.[side]) || 0));
-  return { x: out('left', 'right'), y: out('top', 'bottom') };
+  let x = 1;
+  let y = 1;
+  for (let i = 0; i <= REACH_SAMPLES; i += 1) {
+    const t = -1 + (2 * i) / REACH_SAMPLES;
+    for (const [u, v] of [[t, 1], [t, -1], [1, t], [-1, t]]) {
+      const [px, py] = bulgeWarp(bulge, u, v);
+      x = Math.max(x, Math.abs(px));
+      y = Math.max(y, Math.abs(py));
+    }
+  }
+  return { x, y };
 }
 
 const even = (n) => Math.ceil(n / 2) * 2;

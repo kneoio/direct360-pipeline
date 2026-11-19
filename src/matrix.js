@@ -149,7 +149,8 @@ export function gridAims(rows, cols, format) {
  * existed compares equal to the same layout saved now. `projections` (flat,
  * fisheye, planet or pannini per camera; anything else is flat) is kept only
  * when some camera is not flat. `bulges` (per camera {top, right, bottom,
- * left}, each -1..1, see bulgeWarp) is kept only when some side bows; a
+ * left}, each -1..1, with optional `shift` and `corners`, see bulgeOf and
+ * bulgeWarp) is kept only when some side bows or some point moves; a
  * missing one is the straight frame. `names` (per camera a name the user
  * gave it, or null for its number; trimmed, at most CAMERA_NAME_MAX
  * characters) is kept only when some camera has one; `colors` (per camera a
@@ -195,10 +196,16 @@ export function sanitizeLayouts(raw) {
     }
     if (layout.bulges != null) {
       if (!Array.isArray(layout.bulges) || layout.bulges.length !== cameras) throw bad(`${format} layout needs ${cameras} bulges`);
+      const num = (v) => v == null || (typeof v === 'number' && Number.isFinite(v));
       const ok = (b) => b == null || (typeof b === 'object' && !Array.isArray(b)
-        && Object.keys(b).every((side) => BULGE_SIDES.includes(side))
-        && BULGE_SIDES.every((side) => b[side] == null || (typeof b[side] === 'number' && Number.isFinite(b[side]))));
-      if (!layout.bulges.every(ok)) throw bad(`${format} bulges must be {top, right, bottom, left} numbers`);
+        && Object.keys(b).every((key) => BULGE_SIDES.includes(key) || key === 'shift' || key === 'corners')
+        && BULGE_SIDES.every((side) => num(b[side]))
+        && (b.shift == null || (typeof b.shift === 'object' && !Array.isArray(b.shift)
+          && Object.keys(b.shift).every((side) => BULGE_SIDES.includes(side))
+          && BULGE_SIDES.every((side) => num(b.shift[side]))))
+        && (b.corners == null || (Array.isArray(b.corners) && b.corners.length === 4
+          && b.corners.every((c) => Array.isArray(c) && c.length === 2 && c.every(num)))));
+      if (!layout.bulges.every(ok)) throw bad(`${format} bulges must be {top, right, bottom, left} numbers with optional shift and corners`);
       const clean = layout.bulges.map(bulgeOf);
       if (clean.some(hasBulge)) extras.bulges = clean;
     }

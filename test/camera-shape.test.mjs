@@ -58,7 +58,67 @@ test('bulgeOf holds sides inside -1..1 at two decimals; hasBulge and sameBulge t
   assert.equal(sameBulge({ top: 0.5 }, { top: 0.4 }), false);
 });
 
+test('a bows-only shape renders exactly as before (the v360 stage and its warp maps are unchanged)', () => {
+  const stage = projectionStage('flat', 192, 108, 100, { top: 0.5 });
+  assert.equal(stage.w, 384);
+  assert.equal(stage.h, 270);
+  assert.equal(stage.post, "[wv];nullsrc=s=384x216:d=1,format=gray16le,geq=lum='clip(floor(192+((2*X+1)/W-1)*(1+if(gte(((2*X+1)/W-1),0),0,0)*(1-(1-(2*Y+1)/H)*(1-(2*Y+1)/H)))*192),0,383)',trim=end_frame=1,setpts=PTS-1000000/TB[wx];nullsrc=s=384x216:d=1,format=gray16le,geq=lum='clip(floor(135-(1-(2*Y+1)/H)*(1+if(gte((1-(2*Y+1)/H),0),0.25,0)*(1-((2*X+1)/W-1)*((2*X+1)/W-1)))*108),0,269)',trim=end_frame=1,setpts=PTS-1000000/TB[wy];[wv][wx][wy]remap=fill=black,scale=192:108:flags=area");
+  assert.deepEqual(bulgeOf({ top: 0.5 }), { top: 0.5, right: 0, bottom: 0, left: 0 });
+});
+
+test('a moved corner lands where it was put and the opposite corner stays; a shifted top middle slides along the top', () => {
+  const corners = [[0.2, -0.1], [0, 0], [0, 0], [0, 0]];
+  const shape = { ...STRAIGHT, corners };
+  const [x, y] = bulgeWarp(shape, -1, 1);
+  assert.ok(Math.abs(x - (-1 + 0.2)) < 1e-12 && Math.abs(y - (1 - 0.1)) < 1e-12);
+  assert.deepEqual(bulgeWarp(shape, 1, -1), [1, -1]);
+  assert.deepEqual(bulgeWarp(shape, 1, 1), [1, 1]);
+  const top = 0.4;
+  const shifted = { top, right: 0, bottom: 0, left: 0, shift: { top: 0.3, right: 0, bottom: 0, left: 0 } };
+  assert.deepEqual(bulgeWarp(shifted, 0, 1), [0.3, 1 + BULGE_REACH * top]);
+  // The shift fades to nothing at the side's corners and at the frame's middle line.
+  assert.deepEqual(bulgeWarp(shifted, 1, 1), [1, 1]);
+  assert.deepEqual(bulgeWarp(shifted, 0.5, 0), [0.5, 0]);
+  assert.equal(hasBulge({ shift: { left: 0.1 } }), true);
+  assert.equal(hasBulge({ corners: [[0, 0], [0, 0], [0, 0.01], [0, 0]] }), true);
+  assert.equal(sameBulge(shape, { ...shape, corners: [[0.2, -0.1], [0, 0], [0, 0], [0, 0.001]] }), false);
+  assert.equal(sameBulge(shape, { corners }), true);
+});
+
+test('the canvas reach grows with an outward corner and with a shifted middle', () => {
+  assert.deepEqual(bulgeReach(STRAIGHT), { x: 1, y: 1 });
+  const out = bulgeReach({ corners: [[-0.3, 0.2], [0, 0], [0, 0], [0, 0]] });
+  assert.ok(Math.abs(out.x - 1.3) < 1e-12 && Math.abs(out.y - 1.2) < 1e-12, JSON.stringify(out));
+  // An inward corner reaches no further than the straight frame.
+  assert.deepEqual(bulgeReach({ corners: [[0.3, -0.2], [0, 0], [0, 0], [0, 0]] }), { x: 1, y: 1 });
+  const flat = projectionStage('flat', 192, 108, 100, { corners: [[-0.3, 0.2], [0, 0], [0, 0], [0, 0]] });
+  assert.equal(flat.w, 2 * Math.ceil((192 * 2 * 1.3) / 2));
+  assert.equal(flat.h, 2 * Math.ceil((108 * 2 * 1.2) / 2));
+});
+
 // ---------------------------------------------------------------- layouts
+test('layouts keep corners and shift, clamped to ±0.75 at three decimals; all-zero ones are dropped', () => {
+  const bulges = Array(18).fill(null);
+  bulges[1] = { top: 0, shift: { top: 0.12345, right: 2, bottom: 0, left: -9 }, corners: [[0.1, 0], [0, -1], [0, 0], [0.0004, 0]] };
+  bulges[3] = { left: 0.2, shift: { top: 0, right: 0, bottom: 0, left: 0 }, corners: [[0, 0], [0, 0], [0, 0], [0, 0]] };
+  const kept = sanitizeLayouts({ youtube: youtubeLayout({ bulges }) }).youtube;
+  assert.deepEqual(kept.bulges[1], {
+    ...STRAIGHT, shift: { top: 0.123, right: 0.75, bottom: 0, left: -0.75 }, corners: [[0.1, 0], [0, -0.75], [0, 0], [0, 0]],
+  });
+  assert.deepEqual(kept.bulges[3], { ...STRAIGHT, left: 0.2 });
+  assert.deepEqual(layoutBulges(kept, 18)[1], kept.bulges[1]);
+  // Only moved points (no bows) still keep the shapes.
+  const only = Array(18).fill(null);
+  only[0] = { corners: [[0, 0], [0, 0], [0.2, 0], [0, 0]] };
+  assert.deepEqual(sanitizeLayouts({ youtube: youtubeLayout({ bulges: only }) }).youtube.bulges[0], { ...STRAIGHT, corners: [[0, 0], [0, 0], [0.2, 0], [0, 0]] });
+  for (const broken of [{ corners: [[0, 0]] }, { corners: [[0, 0], [0, 0], [0, 0], [0, '1']] }, { shift: { middle: 1 } }, { shift: [1, 0, 0, 0] }]) {
+    assert.throws(() => sanitizeLayouts({ youtube: youtubeLayout({ bulges: Array(18).fill(broken) }) }), (e) => e.status === 400, JSON.stringify(broken));
+  }
+  // Plans carry the whole shape.
+  const plan = planSegments([{ t: 0, camera: 1 }], [0], [0], 2, false, null, null, { bulges: [kept.bulges[1]] });
+  assert.deepEqual(plan[0].bulge, kept.bulges[1]);
+});
+
 test('layouts keep bulges only when a side bows; a straight or missing shape is the old layout; bad shapes are a 400', () => {
   const old = sanitizeLayouts({ youtube: youtubeLayout() }).youtube;
   const zero = sanitizeLayouts({ youtube: youtubeLayout({ bulges: Array(18).fill(STRAIGHT) }) }).youtube;
@@ -185,12 +245,12 @@ const SHAPE = { top: 1, right: -1, bottom: 0.5, left: 0 };
 // Inside the frame, away from the matrix label in the top-left corner.
 const SPOTS = [[96, 2], [189, 54], [96, 105], [2, 54], [96, 54], [150, 20], [60, 90], [189, 2], [180, 100]];
 
-function assertShows(file, width, height, view, label) {
+function assertShows(file, width, height, view, label, shape = SHAPE) {
   for (const [px, py] of SPOTS) {
     const sx = Math.round((px * width) / 192);
     const sy = Math.round((py * height) / 108);
     const [u, v] = frameUV(sx, sy, width, height);
-    const want = flatColour(...bulgeWarp(SHAPE, u, v), view);
+    const want = flatColour(...bulgeWarp(shape, u, v), view);
     const got = pixel(file, sx, sy);
     const off = Math.max(...got.map((c, k) => Math.abs(c - want[k])));
     assert.ok(off <= 10, `${label} at ${sx},${sy}: got ${got}, want ${want.map(Math.round)}`);
@@ -216,6 +276,22 @@ test('a final hold shows the bowed frame: each output pixel is the direction bul
     await renderFromEdl(src, zero, [{ t: 0, camera: 1 }], { ...common, bulges: [STRAIGHT] });
     assert.equal(psnrOf(old, zero), Infinity);
     assert.ok(psnrOf(old, bowed) < 35);
+  });
+});
+
+test('a final hold shows moved corners and shifted middles where bulgeWarp puts them', { timeout: 240000 }, async () => {
+  await withTemp('d360-shape-points-', async (tmp) => {
+    const src = makeSource(tmp);
+    const shape = bulgeOf({
+      top: 0.5, right: -0.3,
+      corners: [[-0.2, 0.15], [0.1, 0.2], [0.25, -0.1], [-0.15, -0.2]],
+      shift: { top: 0.3, right: -0.2, bottom: -0.25, left: 0.15 },
+    });
+    const out = path.join(tmp, 'points.mp4');
+    await renderFromEdl(src, out, [{ t: 0, camera: 1 }], { format: 'youtube', yaws: [0], pitches: [0], width: 192, height: 108, bulges: [shape], log: () => {} });
+    const png = path.join(tmp, 'points.png');
+    frameOf(out, png, 5);
+    assertShows(png, 192, 108, fieldOfView(192, 108, 100), 'points', shape);
   });
 });
 
