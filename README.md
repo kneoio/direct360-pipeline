@@ -37,7 +37,8 @@ docker build -f worker/Dockerfile --build-arg GIT_SHA=$(git rev-parse --short HE
 ```
 
 RunPod → Serverless → New Endpoint → Deploy from a GitHub repository: this repo, Dockerfile path `worker/Dockerfile`,
-build context the repo root.
+build context the repo root. RunPod rebuilds the workers on a new release of this repo: after a worker change, run
+Actions → Release worker, which releases master's current commit as `worker-<run number>`.
 
 ## Using it from another project
 

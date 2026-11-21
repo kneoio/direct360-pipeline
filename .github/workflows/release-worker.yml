@@ -1,0 +1,20 @@
+name: Release worker
+
+# RunPod rebuilds the Serverless workers (worker/Dockerfile) when this repo gets a new release.
+# Run by hand after a worker change: it releases the chosen branch's current commit.
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="worker-${{ github.run_number }}"
+          gh release create "$tag" -R "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "Worker $tag (${GITHUB_SHA::7})" --notes "RunPod rebuilds its workers from ${GITHUB_SHA::7}."
