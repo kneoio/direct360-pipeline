@@ -1,11 +1,11 @@
 {
   "name": "direct360-pipeline",
   "private": true,
-  "description": "The Direct360 job pipeline (stitch, camera grid, preview proxy, telemetry, renders) that the agent runs: worker/render.js and what it imports. Bundled into each agent package by build/stage.mjs.",
+  "description": "The Direct360 job pipeline (stitch, preview proxy, telemetry, renders): worker/render.js and what it imports. Run by the Direct360 server, its RunPod worker (worker/handler.py) and the Direct360 Helper Agent.",
   "license": "MIT",
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
-    "test": "node --test test/proxy-args.test.mjs"
+    "test": "node --test test/*.test.mjs"
   }
 }

@@ -1,0 +1,6 @@
+.idea/
+node_modules/
+__pycache__/
+*.o
+worker/gpmf/gpmf2json
+gpu-stitch/gpu-stitch

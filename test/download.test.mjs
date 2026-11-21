@@ -7,7 +7,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   aria2Completed, cachedSource, downloadFile, downloadSource, downloadWatchdog, fetchSource, objectSize, tailBytes,
-} from 'direct360-pipeline/worker/render.js';
+} from '../worker/render.js';
 
 const hasAria2 = spawnSync('aria2c', ['--version']).status === 0;
 

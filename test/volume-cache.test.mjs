@@ -4,10 +4,10 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { cachedSource, discardsSource, jobStats } from 'direct360-pipeline/worker/render.js';
+import { cachedSource, discardsSource, jobStats } from '../worker/render.js';
 import {
   cacheFile, cacheKey, cleanupCache, multipartEtag, storeProduced, volumeCacheDir,
-} from 'direct360-pipeline/worker/volumeCache.js';
+} from '../worker/volumeCache.js';
 
 const HOUR = 3600 * 1000;
 

@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   PAN_KINDS, PLANET_FADE, centreScale, planSegments, renderFromEdl, sanitizeEdl, transitionFovs, transitionKinds, transitionWeight,
-} from 'direct360-pipeline/src/edl.js';
+} from '../src/edl.js';
 
 // ---------------------------------------------------------------- planning
 test('transitions: a pan between the same picture, blend between any two pictures, planet between flat and planet', () => {

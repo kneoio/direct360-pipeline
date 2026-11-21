@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   DEFAULT_PAN_CURVE, panCurveMean, panPose, panProgress, panYawDelta, planChunks, planSegments, renderFromEdl, sanitizeEdl,
-} from 'direct360-pipeline/src/edl.js';
+} from '../src/edl.js';
 
 const plan = (entry, { yaws = [0, 40], pitches = [0, 0], duration = 12 } = {}) => planSegments(
   [{ t: 0, camera: 1 }, { t: duration, camera: 2, panSpeed: 10, ...entry }], yaws, pitches, duration,

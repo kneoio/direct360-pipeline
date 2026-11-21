@@ -6,9 +6,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   FOV_RANGES, PROJECTIONS, clampFov, fieldOfView, panniniSide, projectedFieldOfView, projectionOf, projectionStage,
-} from 'direct360-pipeline/src/formats.js';
-import { layoutFovs, layoutProjections, sanitizeLayouts } from 'direct360-pipeline/src/matrix.js';
-import { panFieldOfView, planChunks, planSegments, renderFromEdl, resolveView } from 'direct360-pipeline/src/edl.js';
+} from '../src/formats.js';
+import { layoutFovs, layoutProjections, sanitizeLayouts } from '../src/matrix.js';
+import { panFieldOfView, planChunks, planSegments, renderFromEdl, resolveView } from '../src/edl.js';
 
 const youtubeLayout = (extra = {}) => ({
   yaws: Array.from({ length: 18 }, (_, i) => i * 10),

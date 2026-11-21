@@ -1,0 +1,6 @@
+.git
+node_modules
+test
+**/*.mp4
+**/*.o
+worker/gpmf/gpmf2json

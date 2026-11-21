@@ -4,8 +4,8 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { eacToEquirectFilter, stitchGopro, stitchPreset, stitchEngine, gpuStitchCq } from 'direct360-pipeline/src/gopro.js';
-import { chunkMinSeconds, containerLimits, planChunks } from 'direct360-pipeline/src/edl.js';
+import { eacToEquirectFilter, stitchGopro, stitchPreset, stitchEngine, gpuStitchCq } from '../src/gopro.js';
+import { chunkMinSeconds, containerLimits, planChunks } from '../src/edl.js';
 
 test('stitch preset is veryfast unless D360_STITCH_PRESET names an x264 preset', () => {
   assert.equal(stitchPreset({}), 'veryfast');
@@ -80,11 +80,12 @@ test('chunked stitch keeps the source frame count and puts an IDR on every chunk
       '-of', 'json', out,
     ])).streams;
     assert.ok(streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
-    const keys = ffprobe([
+    // JSON, not csv: ffprobe 5's csv adds a side-data row after each chunk's IDR, which would shift the indices.
+    const keys = JSON.parse(ffprobe([
       '-select_streams', 'v:0',
       '-show_entries', 'frame=key_frame',
-      '-of', 'csv=p=0', out,
-    ]).trim().split('\n').map((line) => line.split(',')[0]);
+      '-of', 'json', out,
+    ])).frames.map((f) => String(f.key_frame));
     const keyAt = new Set(planned.map((chunk) => chunk.seekFrame));
     assert.equal(keys.length, 6);
     keys.forEach((flag, index) => {

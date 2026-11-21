@@ -4,8 +4,8 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fieldOfView } from 'direct360-pipeline/src/formats.js';
-import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl, keptFrameRanges } from 'direct360-pipeline/src/edl.js';
+import { fieldOfView } from '../src/formats.js';
+import { chunkMinSeconds, containerLimits, panPose, planChunks, planSegments, renderFromEdl, keptFrameRanges } from '../src/edl.js';
 
 test('chunk length is at least the minimum and otherwise the clip over two waves of cores', () => {
   assert.equal(chunkMinSeconds(110, 16, {}), 4);
@@ -79,6 +79,16 @@ function ffprobe(args) {
   return result.stdout;
 }
 
+/** `key_frame,best_effort_timestamp_time` per video frame. From JSON: ffprobe 5's csv adds a side-data row after a
+ * frame that carries some (each chunk's IDR here), which would shift the indices. */
+function frameTimes(file) {
+  return JSON.parse(ffprobe([
+    '-select_streams', 'v:0',
+    '-show_entries', 'frame=key_frame,best_effort_timestamp_time',
+    '-of', 'json', file,
+  ])).frames.map((f) => `${f.key_frame},${f.best_effort_timestamp_time}`);
+}
+
 test('a chunked yaw pan matches per-frame v360 and the joined frame count', { timeout: 120000 }, async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'd360-pan-'));
   const previous = {
@@ -136,11 +146,7 @@ test('a chunked yaw pan matches per-frame v360 and the joined frame count', { ti
     assert.ok(streams.some((stream) => stream.codec_type === 'audio' && stream.codec_name === 'aac'));
     assert.ok(Math.abs(Number(facts.format.duration) - 4) < 1.5 / 30);
 
-    const times = ffprobe([
-      '-select_streams', 'v:0',
-      '-show_entries', 'frame=key_frame,best_effort_timestamp_time',
-      '-of', 'csv=p=0', out,
-    ]).trim().split('\n');
+    const times = frameTimes(out);
     const keys = times.map((line, index) => (line.startsWith('1,') ? index : -1)).filter((index) => index >= 0);
     const srcInfo = JSON.parse(ffprobe([
       '-show_entries', 'format=duration',
@@ -295,11 +301,7 @@ test('a pitch pan across camera rows keeps frame count, border continuity, and s
     assert.equal(Number(facts.streams[0].nb_read_frames), 120);
     assert.ok(Math.abs(Number(facts.format.duration) - 4) < 1.5 / 30);
 
-    const times = ffprobe([
-      '-select_streams', 'v:0',
-      '-show_entries', 'frame=key_frame,best_effort_timestamp_time',
-      '-of', 'csv=p=0', out,
-    ]).trim().split('\n');
+    const times = frameTimes(out);
     const keys = times.map((line, index) => (line.startsWith('1,') ? index : -1)).filter((index) => index >= 0);
     const srcInfo = JSON.parse(ffprobe([
       '-show_entries', 'format=duration',

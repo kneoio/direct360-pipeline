@@ -151,7 +151,7 @@ async def handler(job):
             print(line, file=sys.stderr, flush=True)
 
     code, stdout = await run_grouped(
-        ["node", "/app/pipeline/worker/render.js"],
+        ["node", os.path.join(os.path.dirname(os.path.abspath(__file__)), "render.js")],
         json.dumps(job["input"]),
         on_line,
     )

@@ -1,22 +1,15 @@
-# RunPod Serverless worker for the full-quality render. Build from the repo
-# root: docker build -f worker/Dockerfile .
-#
-# The job pipeline (render.js and the modules it imports) is this repo's pipeline/ folder
-# (the direct360-pipeline package, a file: dependency in package.json).
-FROM node:20-bookworm-slim AS deps
-WORKDIR /app
-COPY package*.json ./
-COPY pipeline ./pipeline
-RUN npm ci --omit=dev
+# RunPod Serverless worker: worker/handler.py runs worker/render.js for each job.
+# Build from this repo's root: docker build -f worker/Dockerfile .
+# The pipeline has no npm dependencies, so there is no npm install.
 
 # gpmf2json is GoPro's gpmf-parser (tag v2.2.1, MIT or Apache-2.0). The
-# licenses are copied into the runtime image; sources live in pipeline/worker/gpmf.
+# licenses are copied into the runtime image; sources live in worker/gpmf.
 FROM debian:bookworm-slim AS gpmf
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc libc6-dev make \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY pipeline/worker/gpmf /src
+COPY worker/gpmf /src
 RUN make
 
 # The GPU stitch, used when the endpoint sets D360_STITCH_ENGINE=gpu. PTX only, so
@@ -37,7 +30,7 @@ RUN apt-get update \
  && pip3 install --no-cache-dir --break-system-packages 'runpod==1.12.0' \
  && rm -rf /var/lib/apt/lists/*
 # The info overlay needs ffmpeg's `ass` filter (libass). Debian's ffmpeg has it; fail the
-# build if a different package ever drops it. The font it draws with is pipeline/lib/fonts/DejaVuSansMono.ttf.
+# build if a different package ever drops it. The font it draws with is lib/fonts/DejaVuSansMono.ttf.
 RUN ffmpeg -hide_banner -filters 2>/dev/null | grep -Eq '^ *[A-Z.]+ +ass +V->V'
 COPY --from=gpmf /src/gpmf2json /usr/local/bin/gpmf2json
 ENV GPMF2JSON=/usr/local/bin/gpmf2json
@@ -49,16 +42,12 @@ COPY --from=gpustitch /src/libnvenc_one_gpu.so /usr/local/lib/libnvenc_one_gpu.s
 # Asks the NVIDIA runtime for the video decode and encode libraries too.
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 WORKDIR /app
-COPY package.json ./
-COPY --from=deps /app/node_modules ./node_modules
-# node_modules/direct360-pipeline links to it.
-COPY pipeline ./pipeline
+COPY package.json LICENSE ./
 COPY src ./src
 COPY lib ./lib
-RUN test -s /app/pipeline/lib/fonts/DejaVuSansMono.ttf
-RUN test -s "/app/pipeline/lib/fonts/Digital Play Italic St.ttf"
-RUN test -d /app/lib/emoji
 COPY worker ./worker
+RUN test -s /app/lib/fonts/DejaVuSansMono.ttf
+RUN test -s "/app/lib/fonts/Digital Play Italic St.ttf"
 # Shown as the worker's commit in logs and stats; the version itself is a hash of the files.
 ARG GIT_SHA=
 ENV D360_WORKER_VERSION=$GIT_SHA

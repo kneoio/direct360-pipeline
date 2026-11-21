@@ -4,11 +4,11 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { renderFromEdl } from 'direct360-pipeline/src/edl.js';
+import { renderFromEdl } from '../src/edl.js';
 import {
   aimQuat, buildTrack, computeCorrection, decodeOrientation, encodeOrientation, qconj, qmul, qnorm, qrot,
   qToMat, qaxis, quatToV360, stabModeValid, viewAngles, yawSmoothSec,
-} from 'direct360-pipeline/src/stabilize.js';
+} from '../src/stabilize.js';
 
 function ffmpeg(args) {
   const r = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args], { encoding: 'utf8' });

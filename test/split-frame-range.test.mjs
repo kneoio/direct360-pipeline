@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { splitFrameRange } from 'direct360-pipeline/src/edl.js';
+import { splitFrameRange } from '../src/edl.js';
 
 function checkContiguous(parts, totalFrames) {
   assert.equal(parts[0].startFrame, 0);
