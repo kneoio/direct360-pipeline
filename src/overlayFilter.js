@@ -12,8 +12,8 @@ export const OVERLAY_FONT = fileURLToPath(new URL('../lib/fonts/DejaVuSansMono.t
 export const OVERLAY_FONT_DIR = path.dirname(OVERLAY_FONT);
 export const OVERLAY_FONT_FAMILY = 'DejaVu Sans Mono';
 /** The speed reads like a dashboard. In the same folder, so the burn's `fontsdir` finds it. */
-export const SPEED_FONT = fileURLToPath(new URL('../lib/fonts/Digital Play Italic St.ttf', import.meta.url));
-export const SPEED_FONT_FAMILY = 'Digital Play Italic St';
+export const SPEED_FONT = fileURLToPath(new URL('../lib/fonts/Orbitron-Variable.ttf', import.meta.url));
+export const SPEED_FONT_FAMILY = 'Orbitron';
 export const OVERLAY_UNAVAILABLE = 'overlay_unavailable';
 export function overlayUnavailable(detail) {
   return Object.assign(new Error(`${OVERLAY_UNAVAILABLE}: ${detail}`), { code: OVERLAY_UNAVAILABLE });

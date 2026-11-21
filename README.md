@@ -52,5 +52,7 @@ and import modules by path, e.g. `import { renderFromEdl } from 'direct360-pipel
 
 ## Licence
 
-MIT (`LICENSE`). `worker/gpmf/third_party/gpmf-parser` is GoPro's, MIT or Apache-2.0; `lib/fonts/DejaVuSansMono.ttf`
-is under its own licence (`lib/fonts/DejaVuSansMono-LICENSE.txt`).
+MIT (`LICENSE`). `worker/gpmf/third_party/gpmf-parser` is GoPro's, MIT or Apache-2.0. The fonts are under their own licences:
+`lib/fonts/DejaVuSansMono.ttf` (Bitstream Vera, `lib/fonts/DejaVuSansMono-LICENSE.txt`) and `lib/fonts/Orbitron-Variable.ttf`, the speed
+readout (SIL Open Font License 1.1, `lib/fonts/Orbitron-Variable-OFL.txt`).
+

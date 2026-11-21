@@ -47,7 +47,7 @@ COPY src ./src
 COPY lib ./lib
 COPY worker ./worker
 RUN test -s /app/lib/fonts/DejaVuSansMono.ttf
-RUN test -s "/app/lib/fonts/Digital Play Italic St.ttf"
+RUN test -s /app/lib/fonts/Orbitron-Variable.ttf
 # Shown as the worker's commit in logs and stats; the version itself is a hash of the files.
 ARG GIT_SHA=
 ENV D360_WORKER_VERSION=$GIT_SHA
