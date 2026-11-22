@@ -355,8 +355,10 @@ export function strengthCurves(projection, strength = 0, fov = FOV_RANGES[projec
   const s = Math.min(1, Math.max(-1, Number(strength) || 0));
   // The largest |k| whose curve still holds the frame's widest angle (half the fov) before tan or sin turns.
   const fits = (0.98 * 90) / (fov / 2);
+  // The largest |k| a sin curve can take while a frame corner (up to 1.25 frame halves out) still has a direction.
+  const sinFits = (0.95 * Math.asin(0.8) * 180) / Math.PI / (fov / 2);
   if (projection === 'fisheye') return [s < 0 ? -s * Math.min(0.85, fits) : -s * Math.min(0.9, fits), 0];
-  if (projection === 'planet') return [s >= 0 ? 0.5 + s * (Math.min(0.75, fits - 0.06) - 0.5) : 0.5 + 0.75 * s, 0];
+  if (projection === 'planet') return [s >= 0 ? 0.5 + s * (Math.min(0.75, fits - 0.06) - 0.5) : 0.5 + s * (0.5 + Math.min(0.6, sinFits)), 0];
   if (projection === 'pannini') return [s < 0 ? -1 - 1.6 * s : -1 - 0.06 * s, s > 0 ? 1 - 1.6 * s : 1];
   return [0, 0];
 }
