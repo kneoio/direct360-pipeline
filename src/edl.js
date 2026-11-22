@@ -79,7 +79,7 @@ import { fileURLToPath } from 'node:url';
 import { run, FFMPEG, probe } from './encoder.js';
 import { parseGrid, gridAims, isRearAim } from './matrix.js';
 import { assertOverlayAvailable, withOverlay, filterPath } from './overlayFilter.js';
-import { projectedFieldOfView, projectionOf, projectionStage, outputSize, FORMATS, FOV_DEFAULT, FOV_RANGES, bulgeOf, bulgeReach, hasBulge, sameBulge, BULGE_SUPERSAMPLE } from './formats.js';
+import { projectedFieldOfView, projectionOf, projectionStage, outputSize, FORMATS, FOV_DEFAULT, FOV_RANGES, bulgeOf, bulgeReach, hasBulge, sameBulge, strengthOf, BULGE_SUPERSAMPLE } from './formats.js';
 import { viewAngles } from './stabilize.js';
 import { assertFlatEdl, flatFitFilter } from './flatCameras.js';
 import {
@@ -161,9 +161,18 @@ export function sanitizePanKind(raw) {
   return PAN_KINDS.includes(raw) ? raw : null;
 }
 
-/** The same picture: same projection, the same pannini zoom (it has none at run time) and the same shape. */
+/**
+ * The same picture: same projection, the same shape, and the same zoom where the zoom is fixed while v360 runs: pannini
+ * (it has none at run time) and a wide projection bent by a strength (its warp is built for one zoom).
+ */
 export function samePicture(a, b) {
-  return a.projection === b.projection && (a.projection !== 'pannini' || a.fov === b.fov) && sameBulge(a.bulge, b.bulge);
+  return a.projection === b.projection && (!fixedZoom(a) || a.fov === b.fov) && sameBulge(a.bulge, b.bulge);
+}
+
+/** A picture whose zoom cannot move while v360 runs: pannini, or a wide projection bent by a strength. */
+export function fixedZoom(pic) {
+  const kind = projectionOf(pic.projection);
+  return kind === 'pannini' || (kind !== 'flat' && strengthOf(pic.bulge) !== 0);
 }
 
 /**
@@ -215,12 +224,13 @@ export function fovForScale(projection, scale) {
  * The fov each picture of a transition is drawn at, `p` of the way (on the pan's ease) from `from` to `to` (each
  * {projection, fov}). Both show the middle of the frame at the same size, which goes from the first picture's to the
  * second's evenly (in log), so the two pictures lie on each other in the middle and only part towards the edges; at
- * p 0 the first is exactly its camera, at p 1 the second. Pannini keeps its own zoom (it has none at run time): with
- * pannini on either side each picture moves from its own fov to the other's, flat held inside its range.
+ * p 0 the first is exactly its camera, at p 1 the second. A picture with a fixed zoom (fixedZoom: pannini, or a bent
+ * wide projection) keeps its own; with one on either side the other picture moves from its own fov to the other's,
+ * flat held inside its range.
  */
 export function transitionFovs(from, to, p) {
-  const a = centreScale(from.projection, from.fov);
-  const b = centreScale(to.projection, to.fov);
+  const a = fixedZoom(from) ? null : centreScale(from.projection, from.fov);
+  const b = fixedZoom(to) ? null : centreScale(to.projection, to.fov);
   if (a != null && b != null) {
     const scale = Math.exp(Math.log(a) + (Math.log(b) - Math.log(a)) * p);
     return { from: p <= 0 ? from.fov : fovForScale(from.projection, scale), to: p >= 1 ? to.fov : fovForScale(to.projection, scale) };
@@ -228,7 +238,7 @@ export function transitionFovs(from, to, p) {
   const path = from.fov + (to.fov - from.fov) * p;
   const own = (pic) => {
     const kind = projectionOf(pic.projection);
-    if (kind === 'pannini') return pic.fov;
+    if (fixedZoom(pic)) return pic.fov;
     if (kind === 'flat') return Math.min(FOV_RANGES.flat.max, Math.max(FOV_RANGES.flat.min, path));
     return path;
   };
@@ -1234,7 +1244,7 @@ export function transitionCommands(angles, fovs, weights, { num, den, width, hei
     const parts = [];
     for (const [tag, pic, side] of [['a', from, 'from'], ['b', to, 'to']]) {
       parts.push(`v360@${tag} yaw ${a.yaw.toFixed(4)}`, `v360@${tag} pitch ${a.pitch.toFixed(4)}`, `v360@${tag} roll ${a.roll.toFixed(4)}`);
-      if (projectionOf(pic.projection) !== 'pannini') {
+      if (!fixedZoom(pic)) {
         const view = projectedFieldOfView(width, height, fovs[n][side], pic.projection, pic.bulge);
         parts.push(`v360@${tag} h_fov ${view.hfov.toFixed(4)}`, `v360@${tag} v_fov ${view.vfov.toFixed(4)}`);
       }
@@ -1482,7 +1492,7 @@ export async function renderFromEdl(src, out, edl, {
   // A bowed camera's v360 draws a larger view: budget each ffmpeg for that size.
   const drawn = segments.reduce((most, seg) => {
     if (!seg.bulge) return most;
-    const reach = bulgeReach(seg.bulge);
+    const reach = bulgeReach(seg.bulge, { projection: seg.projection, width, height, fov: seg.type === 'hold' ? seg.fov : seg.fromFov });
     return Math.max(most, BULGE_SUPERSAMPLE * BULGE_SUPERSAMPLE * reach.x * reach.y);
   }, 1);
   const plan = ffmpegMemoryPlan({

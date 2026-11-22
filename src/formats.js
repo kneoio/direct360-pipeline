@@ -185,7 +185,7 @@ export function projectedFieldOfView(width, height, fov, projection = PROJECTION
   }
   if (!hasBulge(bulge)) return view;
   // A bowed frame is drawn wider (see projectionStage), so the view widens with it.
-  const { ex, ey } = bulgeCanvas(width, height, bulge);
+  const { ex, ey } = bulgeCanvas(width, height, bulge, kind, fov);
   return { hfov: widenFov(kind, view.hfov, ex), vfov: widenFov(kind, view.vfov, ey) };
 }
 
@@ -220,13 +220,13 @@ export function projectionStage(projection, width, height, fov, bulge = null, ta
     halfW = (width * w) / (2 * side);
     halfH = (height * w) / (2 * side);
   } else {
-    ({ w, h } = bulgeCanvas(width, height, bulge));
+    ({ w, h } = bulgeCanvas(width, height, bulge, kind, fov));
     halfW = (width * q) / 2;
     halfH = (height * q) / 2;
   }
   return {
     output: PROJECTION_V360[kind], w, h, crop: '',
-    post: bulgeRemap(bulge, { srcW: w, srcH: h, halfW, halfH, outW: width * q, outH: height * q, width, height, tag }),
+    post: bulgeRemap(bulge, { srcW: w, srcH: h, halfW, halfH, outW: width * q, outH: height * q, width, height, tag, projection: kind, fov }),
   };
 }
 
@@ -237,7 +237,7 @@ export function projectionStage(projection, width, height, fov, bulge = null, ta
  * each, made by geq; remap holds them for every frame. They sit far before
  * any video time so a part that starts late still has them.
  */
-function bulgeRemap(bulge, { srcW, srcH, halfW, halfH, outW, outH, width, height, tag }) {
+function bulgeRemap(bulge, { srcW, srcH, halfW, halfH, outW, outH, width, height, tag, projection = PROJECTION_DEFAULT, fov = FOV_DEFAULT }) {
   const n = (v) => +Number(v).toFixed(6);
   const k = (side) => n(BULGE_REACH * (Number(bulge?.[side]) || 0));
   // u right, v up, both -1..1 over the output's pixel centres.
@@ -269,8 +269,12 @@ function bulgeRemap(bulge, { srcW, srcH, halfW, halfH, outW, outH, width, height
   }
   // A bows-only shape keeps its old expression; with added terms the sum is bracketed.
   const group = (e, plain) => (e === plain ? e : `(${e})`);
-  const xmap = `clip(floor(${n(srcW / 2)}+${group(su, suBows)}*${n(halfW)}),0,${srcW - 1})`;
-  const ymap = `clip(floor(${n(srcH / 2)}-${group(sv, svBows)}*${n(halfH)}),0,${srcH - 1})`;
+  // A wide projection bent looser or stronger: the shaped point moves to where the standard picture has its direction.
+  const bent = strengthExpressions(projection, width, height, fov, strengthOf(bulge), group(su, suBows), group(sv, svBows));
+  const fu = bent ? `(${bent[0]})` : group(su, suBows);
+  const fv = bent ? `(${bent[1]})` : group(sv, svBows);
+  const xmap = `clip(floor(${n(srcW / 2)}+${fu}*${n(halfW)}),0,${srcW - 1})`;
+  const ymap = `clip(floor(${n(srcH / 2)}-${fv}*${n(halfH)}),0,${srcH - 1})`;
   const map = (expr) => `nullsrc=s=${outW}x${outH}:d=1,format=gray16le,geq=lum='${expr}',trim=end_frame=1,setpts=PTS-1000000/TB`;
   return `[${tag}v];${map(xmap)}[${tag}x];${map(ymap)}[${tag}y];`
     + `[${tag}v][${tag}x][${tag}y]remap=fill=black,scale=${width}:${height}:flags=area`;
@@ -320,13 +324,111 @@ export function bulgeOf(value) {
   if (BULGE_SIDES.some((side) => shift[side])) out.shift = shift;
   const corners = BULGE_CORNERS.map((_, k) => [pin(value?.corners?.[k]?.[0]), pin(value?.corners?.[k]?.[1])]);
   if (corners.some(([a, b]) => a || b)) out.corners = corners;
+  const strength = Number(value?.strength);
+  const held = Number.isFinite(strength) ? Math.round(Math.min(1, Math.max(-1, strength)) * 100) / 100 || 0 : 0;
+  if (held) out.strength = held;
   return out;
 }
 
-/** True when some side of `bulge` bows or some corner or side middle moves. */
+/**
+ * True when the frame needs the warp: some side bows, some corner or side middle moves, or a wide projection bends
+ * looser or stronger than its standard (`strength`, see strengthWarp; a flat camera ignores it).
+ */
 export function hasBulge(bulge) {
   const b = bulgeOf(bulge);
-  return BULGE_SIDES.some((side) => Boolean(b[side])) || !!b.shift || !!b.corners;
+  return BULGE_SIDES.some((side) => Boolean(b[side])) || !!b.shift || !!b.corners || !!b.strength;
+}
+
+/**
+ * How strongly a wide projection bends, -1 … 1 (`strength` in the shape; 0 is the projection's standard look, which is
+ * what v360 draws). Each projection is a curve of one family, `radial(k, angle)`: k > 0 bends like tan (towards a
+ * normal lens), k < 0 like sin (towards a ball), 0 is the plain angle. Fisheye's standard is k 0 (equidistant),
+ * planet's k ½ (stereographic), pannini's k -1 across (sine of longitude) and 1 up and down (tangent of latitude).
+ * The web editor's lens.js has the same curves, so the render is what the editor shows.
+ */
+export const radial = (k, t) => (k > 1e-4 ? Math.tan(k * t) / k : k < -1e-4 ? Math.sin(-k * t) / -k : t);
+export const radialInverse = (k, x) => (k > 1e-4 ? Math.atan(k * x) / k : k < -1e-4 ? Math.asin(Math.min(1, Math.max(-1, -k * x))) / -k : x);
+/** The pannini square's edge as a longitude (v360 draws about ±84°). */
+const PANNINI_EDGE_LON = (84 * Math.PI) / 180;
+/** The curves of `projection` at `strength` and zoom `fov`: [k, kv] (kv only for pannini's up and down). */
+export function strengthCurves(projection, strength = 0, fov = FOV_RANGES[projectionOf(projection)].default) {
+  const s = Math.min(1, Math.max(-1, Number(strength) || 0));
+  // The largest |k| whose curve still holds the frame's widest angle (half the fov) before tan or sin turns.
+  const fits = (0.98 * 90) / (fov / 2);
+  if (projection === 'fisheye') return [s < 0 ? -s * Math.min(0.85, fits) : -s * Math.min(0.9, fits), 0];
+  if (projection === 'planet') return [s >= 0 ? 0.5 + s * (Math.min(0.62, fits) - 0.5) : 0.5 + 0.5 * s, 0];
+  if (projection === 'pannini') return [s < 0 ? -1 - 1.6 * s : -1 - 0.06 * s, s > 0 ? 1 - 1.6 * s : 1];
+  return [0, 0];
+}
+/** A shape's strength (0 when it has none). */
+export const strengthOf = (bulge) => Number(bulgeOf(bulge).strength) || 0;
+
+/** The frame's axes as the editor measures them (from the fov at 100°): x across, y up, the short one shrunk. */
+function frameAxes(width, height) {
+  const base = fieldOfView(width, height, 100);
+  const wide = base.hfov >= base.vfov;
+  const s = wide ? base.vfov / base.hfov : base.hfov / base.vfov;
+  return wide ? [1, s] : [s, 1];
+}
+
+/**
+ * The point (u, v) of a camera's frame drawn at `strength`, as the point of the same direction in the projection's
+ * standard frame (where v360 draws it). Flat, or strength 0, leaves it where it is.
+ */
+export function strengthWarp(projection, width, height, fov, strength, u, v) {
+  const kind = projectionOf(projection);
+  const s = Number(strength) || 0;
+  if (kind === 'flat' || !s) return [u, v];
+  const [k, kv] = strengthCurves(kind, s, fov);
+  const [k0, kv0] = strengthCurves(kind, 0, fov);
+  if (kind === 'pannini') {
+    const side = panniniSide(width, height, fov);
+    const r = side / width;
+    const rq = side / height;
+    const lon = radialInverse(k, (Math.min(r, Math.max(-r, u)) / r) * radial(k, PANNINI_EDGE_LON));
+    const lat = radialInverse(kv, Math.min(rq, Math.max(-rq, v)) / rq);
+    return [(r * radial(k0, lon)) / radial(k0, PANNINI_EDGE_LON), rq * radial(kv0, lat)];
+  }
+  const [a, b] = frameAxes(width, height);
+  const rho = Math.hypot(u * a, v * b);
+  if (rho < 1e-9) return [u, v];
+  const edge = ((fov / 2) * Math.PI) / 180;
+  const off = radialInverse(k, rho * radial(k, edge));
+  const f = radial(k0, off) / radial(k0, edge) / rho;
+  return [u * f, v * f];
+}
+
+/** strengthWarp as geq expressions of the frame point expressions `u` and `v`: [u, v], or null when it changes nothing. */
+function strengthExpressions(projection, width, height, fov, strength, u, v) {
+  const kind = projectionOf(projection);
+  const s = Number(strength) || 0;
+  if (kind === 'flat' || !s) return null;
+  const n = (x) => +Number(x).toFixed(9);
+  const curve = (k, t) => (k > 1e-4 ? `tan(${n(k)}*${t})/${n(k)}` : k < -1e-4 ? `sin(${n(-k)}*${t})/${n(-k)}` : t);
+  const inverse = (k, x) => (k > 1e-4 ? `atan(${n(k)}*${x})/${n(k)}` : k < -1e-4 ? `asin(clip(${n(-k)}*${x},-1,1))/${n(-k)}` : x);
+  const [k, kv] = strengthCurves(kind, s, fov);
+  const [k0, kv0] = strengthCurves(kind, 0, fov);
+  if (kind === 'pannini') {
+    const side = panniniSide(width, height, fov);
+    const r = side / width;
+    const rq = side / height;
+    const lon = inverse(k, `clip(${u},${n(-r)},${n(r)})*${n(radial(k, PANNINI_EDGE_LON) / r)}`);
+    const lat = inverse(kv, `clip(${v},${n(-rq)},${n(rq)})*${n(1 / rq)}`);
+    return [`${n(r / radial(k0, PANNINI_EDGE_LON))}*${curve(k0, `(${lon})`)}`, `${n(rq)}*${curve(kv0, `(${lat})`)}`];
+  }
+  const [a, b] = frameAxes(width, height);
+  const edge = ((fov / 2) * Math.PI) / 180;
+  // ld(0), ld(1): the frame point; ld(2) its distance from the middle; ld(3) the angle there; ld(4) the scale.
+  const scale = `st(0,${u});st(1,${v});st(2,hypot(ld(0)*${n(a)},ld(1)*${n(b)}));`
+    + `st(3,${inverse(k, `ld(2)*${n(radial(k, edge))}`)});`
+    + `st(4,if(gt(ld(2),0.000000001),(${curve(k0, 'ld(3)')})*${n(1 / radial(k0, edge))}/ld(2),1));`;
+  return [`${scale}ld(0)*ld(4)`, `${scale}ld(1)*ld(4)`];
+}
+
+/** The whole warp of a camera's frame: its shape, then its strength. */
+export function frameWarp(projection, width, height, fov, bulge, u, v) {
+  const [x, y] = bulgeWarp(bulge, u, v);
+  return strengthWarp(projection, width, height, fov, strengthOf(bulge), x, y);
 }
 
 /** True when two shapes are the same (anything missing is 0). */
@@ -366,21 +468,31 @@ export function bulgeWarp(bulge, u, v) {
 const REACH_SAMPLES = 64;
 
 /**
+ * A strength reaching further than this many frame halves (a much looser tiny planet's far corners) is drawn to that
+ * edge: the view v360 would need grows without bound there.
+ */
+export const STRENGTH_REACH_MAX = 2.5;
+
+/**
  * How far out of the straight frame a shaped one reaches, per axis, in frame
  * halves (1 = no further): the furthest |x| and |y| the frame's edge warps to.
+ * With `view` ({ projection, width, height, fov }) the strength counts too.
  */
-export function bulgeReach(bulge) {
+export function bulgeReach(bulge, view = null) {
+  const warp = view
+    ? (u, v) => frameWarp(view.projection, view.width, view.height, view.fov, bulge, u, v)
+    : (u, v) => bulgeWarp(bulge, u, v);
   let x = 1;
   let y = 1;
   for (let i = 0; i <= REACH_SAMPLES; i += 1) {
     const t = -1 + (2 * i) / REACH_SAMPLES;
     for (const [u, v] of [[t, 1], [t, -1], [1, t], [-1, t]]) {
-      const [px, py] = bulgeWarp(bulge, u, v);
+      const [px, py] = warp(u, v);
       x = Math.max(x, Math.abs(px));
       y = Math.max(y, Math.abs(py));
     }
   }
-  return { x, y };
+  return { x: Math.min(x, STRENGTH_REACH_MAX), y: Math.min(y, STRENGTH_REACH_MAX) };
 }
 
 const even = (n) => Math.ceil(n / 2) * 2;
@@ -391,9 +503,9 @@ const even = (n) => Math.ceil(n / 2) * 2;
  * how much wider and taller that view is than the straight frame (after
  * rounding to even pixels), which is what the field of view grows by.
  */
-function bulgeCanvas(width, height, bulge) {
+function bulgeCanvas(width, height, bulge, projection = PROJECTION_DEFAULT, fov = FOV_DEFAULT) {
   const q = BULGE_SUPERSAMPLE;
-  const reach = bulgeReach(bulge);
+  const reach = bulgeReach(bulge, { projection, width, height, fov });
   const w = even(width * q * reach.x);
   const h = even(height * q * reach.y);
   return { w, h, ex: w / (width * q), ey: h / (height * q) };
