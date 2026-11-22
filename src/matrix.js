@@ -198,14 +198,15 @@ export function sanitizeLayouts(raw) {
       if (!Array.isArray(layout.bulges) || layout.bulges.length !== cameras) throw bad(`${format} layout needs ${cameras} bulges`);
       const num = (v) => v == null || (typeof v === 'number' && Number.isFinite(v));
       const ok = (b) => b == null || (typeof b === 'object' && !Array.isArray(b)
-        && Object.keys(b).every((key) => BULGE_SIDES.includes(key) || key === 'shift' || key === 'corners')
+        && Object.keys(b).every((key) => BULGE_SIDES.includes(key) || key === 'shift' || key === 'corners' || key === 'strength')
         && BULGE_SIDES.every((side) => num(b[side]))
+        && num(b.strength)
         && (b.shift == null || (typeof b.shift === 'object' && !Array.isArray(b.shift)
           && Object.keys(b.shift).every((side) => BULGE_SIDES.includes(side))
           && BULGE_SIDES.every((side) => num(b.shift[side]))))
         && (b.corners == null || (Array.isArray(b.corners) && b.corners.length === 4
           && b.corners.every((c) => Array.isArray(c) && c.length === 2 && c.every(num)))));
-      if (!layout.bulges.every(ok)) throw bad(`${format} bulges must be {top, right, bottom, left} numbers with optional shift and corners`);
+      if (!layout.bulges.every(ok)) throw bad(`${format} bulges must be {top, right, bottom, left} numbers with optional shift, corners and strength`);
       const clean = layout.bulges.map(bulgeOf);
       if (clean.some(hasBulge)) extras.bulges = clean;
     }

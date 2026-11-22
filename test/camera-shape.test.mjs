@@ -137,6 +137,16 @@ test('layouts keep bulges only when a side bows; a straight or missing shape is 
   }
 });
 
+test('sanitizeLayouts keeps a camera strength (held to -1 … 1) and refuses one that is not a number', () => {
+  const bulges = Array(18).fill(null);
+  bulges[4] = { ...STRAIGHT, strength: 0.27 };
+  bulges[5] = { ...STRAIGHT, strength: 3 };
+  const kept = sanitizeLayouts({ youtube: youtubeLayout({ bulges }) }).youtube;
+  assert.deepEqual(kept.bulges[4], { ...STRAIGHT, strength: 0.27 });
+  assert.deepEqual(kept.bulges[5], { ...STRAIGHT, strength: 1 });
+  assert.throws(() => sanitizeLayouts({ youtube: youtubeLayout({ bulges: Array(18).fill({ strength: '0.5' }) }) }), (e) => e.status === 400);
+});
+
 test('resolveView fills a straight shape for each camera; a list for other cameras is ignored', () => {
   assert.deepEqual(resolveView({ format: 'youtube', yaws: [0, 10], pitches: [0, 0], bulges: [{ top: 1 }, null] }).bulges, [{ ...STRAIGHT, top: 1 }, STRAIGHT]);
   assert.deepEqual(resolveView({ format: 'youtube', yaws: [0, 10], pitches: [0, 0], bulges: [{ top: 1 }] }).bulges, [STRAIGHT, STRAIGHT]);
