@@ -119,8 +119,8 @@ export const PROJECTION_DEFAULT = 'flat';
 export const PROJECTION_V360 = { flat: 'flat', fisheye: 'fisheye', planet: 'sg', pannini: 'pannini' };
 export const FOV_RANGES = {
   flat: { min: FOV_MIN, max: FOV_MAX, default: FOV_DEFAULT },
-  fisheye: { min: 90, max: 280, default: 160 },
-  planet: { min: 120, max: 340, default: 260 },
+  fisheye: { min: 60, max: 280, default: 160 },
+  planet: { min: 60, max: 340, default: 260 },
   pannini: { min: 120, max: 170, default: 140 },
 };
 
