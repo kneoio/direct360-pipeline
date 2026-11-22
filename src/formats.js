@@ -105,8 +105,8 @@ export function outputSize(format, { preview = false, resolution } = {}) {
 
 /** Per-camera roll (degrees) and zoom (field of view across the frame's long side). */
 export const ROLL_LIMIT = 180;
-export const FOV_MIN = 60;
-export const FOV_MAX = 120;
+export const FOV_MIN = 30;
+export const FOV_MAX = 150;
 export const FOV_DEFAULT = 100;
 
 /**
@@ -119,8 +119,8 @@ export const PROJECTION_DEFAULT = 'flat';
 export const PROJECTION_V360 = { flat: 'flat', fisheye: 'fisheye', planet: 'sg', pannini: 'pannini' };
 export const FOV_RANGES = {
   flat: { min: FOV_MIN, max: FOV_MAX, default: FOV_DEFAULT },
-  fisheye: { min: 120, max: 200, default: 160 },
-  planet: { min: 200, max: 300, default: 260 },
+  fisheye: { min: 90, max: 280, default: 160 },
+  planet: { min: 120, max: 340, default: 260 },
   pannini: { min: 120, max: 170, default: 140 },
 };
 
@@ -355,10 +355,8 @@ export function strengthCurves(projection, strength = 0, fov = FOV_RANGES[projec
   const s = Math.min(1, Math.max(-1, Number(strength) || 0));
   // The largest |k| whose curve still holds the frame's widest angle (half the fov) before tan or sin turns.
   const fits = (0.98 * 90) / (fov / 2);
-  // The largest |k| a sin curve can take while a frame corner (up to 1.25 frame halves out) still has a direction.
-  const sinFits = (0.95 * Math.asin(0.8) * 180) / Math.PI / (fov / 2);
-  if (projection === 'fisheye') return [s < 0 ? -s * Math.min(0.85, fits) : -s * Math.min(0.9, fits), 0];
-  if (projection === 'planet') return [s >= 0 ? 0.5 + s * (Math.min(0.75, fits - 0.06) - 0.5) : 0.5 + s * (0.5 + Math.min(0.6, sinFits)), 0];
+  if (projection === 'fisheye') return [s < 0 ? -s * Math.min(1, fits) : -s * Math.min(0.9, fits), 0];
+  if (projection === 'planet') return [s >= 0 ? 0.5 + s * Math.max(0, Math.min(0.75, fits - 0.06) - 0.5) : 0.5 + s * (0.5 + fits), 0];
   if (projection === 'pannini') return [s < 0 ? -1 - 1.6 * s : -1 - 0.06 * s, s > 0 ? 1 - 1.6 * s : 1];
   return [0, 0];
 }

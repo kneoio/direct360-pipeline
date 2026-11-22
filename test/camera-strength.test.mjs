@@ -24,9 +24,9 @@ test('strength 0 is each projection\'s standard curve, and the editor\'s numbers
   assert.deepEqual(strengthCurves('pannini', 0), [-1, 1]);
   // The same values the web editor's lens.js gives (test/lens-strength.test.mjs there).
   assert.deepEqual(strengthCurves('fisheye', 1, 160), [-0.9, 0]);
-  assert.deepEqual(strengthCurves('fisheye', -1, 160), [0.85, 0]);
+  assert.deepEqual(strengthCurves('fisheye', -1, 160), [1, 0]);
   assert.ok(Math.abs(strengthCurves('planet', 1, 260)[0] - ((0.98 * 90) / 130 - 0.06)) < 1e-12);
-  assert.ok(Math.abs(strengthCurves('planet', -1, 260)[0] + (0.95 * Math.asin(0.8) * 180) / Math.PI / 130) < 1e-12);
+  assert.ok(Math.abs(strengthCurves('planet', -1, 260)[0] + (0.98 * 90) / 130) < 1e-12);
   assert.ok(Math.abs(strengthCurves('pannini', 1)[1] + 0.6) < 1e-12);
 });
 

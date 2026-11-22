@@ -30,7 +30,7 @@ test('a layout without rolls and fovs is kept as it was, and an all-default one 
   assert.deepEqual(layoutFovs(old, 18), Array(18).fill(100));
 });
 
-test('rolls wrap into -180..180 and fovs clamp to 60..120', () => {
+test('rolls wrap into -180..180 and fovs clamp to 30..150', () => {
   const rolls = Array(18).fill(0);
   const fovs = Array(18).fill(100);
   rolls[0] = 30.123;
@@ -42,7 +42,7 @@ test('rolls wrap into -180..180 and fovs clamp to 60..120', () => {
   fovs[2] = 500;
   const got = sanitizeLayouts({ youtube: youtubeLayout({ rolls, fovs }) }).youtube;
   assert.deepEqual(got.rolls.slice(0, 4), [30.12, -170, 90, -180]);
-  assert.deepEqual(got.fovs.slice(0, 3), [80.46, 60, 120]);
+  assert.deepEqual(got.fovs.slice(0, 3), [80.46, 30, 150]);
   assert.equal(got.fovs[3], 100);
 });
 

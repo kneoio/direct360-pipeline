@@ -41,7 +41,7 @@ test('each camera keeps its fov inside the range of its own projection, and a pr
   fovs[3] = 400;
   const got = sanitizeLayouts({ youtube: youtubeLayout({ projections, fovs }) }).youtube;
   assert.deepEqual(got.projections.slice(0, 4), ['flat', 'fisheye', 'planet', 'pannini']);
-  assert.deepEqual(got.fovs.slice(0, 4), [120, 120, 200, 170]);
+  assert.deepEqual(got.fovs.slice(0, 4), [150, 100, 120, 170]);
   const defaults = ['flat', 'fisheye', 'planet', 'pannini'].map((p) => FOV_RANGES[p].default);
   assert.deepEqual(defaults, [100, 160, 260, 140]);
   const same = sanitizeLayouts({
@@ -49,7 +49,7 @@ test('each camera keeps its fov inside the range of its own projection, and a pr
   }).youtube;
   assert.ok(!('fovs' in same), 'fovs at their projections\' defaults are the same layout as none');
   assert.deepEqual(layoutFovs(same, 18).slice(0, 4), defaults);
-  for (const [name, [min, max]] of [['flat', [60, 120]], ['fisheye', [120, 200]], ['planet', [200, 300]], ['pannini', [120, 170]]]) {
+  for (const [name, [min, max]] of [['flat', [30, 150]], ['fisheye', [90, 280]], ['planet', [120, 340]], ['pannini', [120, 170]]]) {
     assert.deepEqual([clampFov(name, 0), clampFov(name, 999)], [min, max], name);
   }
 });

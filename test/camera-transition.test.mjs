@@ -51,7 +51,7 @@ test('both pictures of a transition show the middle of the frame at the same siz
   // Pannini keeps its own zoom; the other picture moves between the two fovs.
   const pan = transitionFovs(flat, { projection: 'pannini', fov: 150 }, 0.5);
   assert.equal(pan.to, 150);
-  assert.equal(pan.from, 120);
+  assert.equal(pan.from, 125);
 });
 
 test('an edit list keeps a transition kind only with a pan speed', () => {
