@@ -118,27 +118,82 @@ const easeInOut = (x) => {
 const normalizeAngle = (deg) => (((deg + 180) % 360 + 360) % 360) - 180;
 
 /**
- * A pan's speed over its length: points `[{at, level}]`, `at` from 0 to 1,
- * `level` 0..100, the speed relative to the peak. The default is the ramp
+ * A pan's speed over its length: points `[{at, level, slope?}]`, `at` from 0
+ * to 1, `level` 0..100, the speed relative to the peak. A point with a `slope`
+ * (levels per whole length) has a handle: the curve passes through it at that
+ * slope and bends smoothly to the next point (a cubic Hermite, each end with
+ * its own handle, or the straight line's slope where it has none); between two
+ * points without handles it is the straight line. The default is the ramp
  * `easeInOut` is made from (mean level 70), so a pan without a curve moves
  * and lasts as it always did; a pan with one lasts 70 / mean(curve) as long.
+ * The web editor draws and times a curve with the same table (curveTable).
  */
 export const DEFAULT_PAN_CURVE = [{ at: 0, level: 0 }, { at: 0.3, level: 100 }, { at: 0.7, level: 100 }, { at: 1, level: 0 }];
 const DEFAULT_PAN_MEAN = 70;
 const PAN_CURVE_POINTS = [2, 12];
 const PAN_CURVE_MIN_MEAN = 5;
 
-/** The area under the piecewise-linear speed `curve` over 0..1. */
-export function panCurveMean(curve) {
-  let area = 0;
-  for (let i = 1; i < curve.length; i++) area += ((curve[i].level + curve[i - 1].level) / 2) * (curve[i].at - curve[i - 1].at);
-  return area;
+/** The steepest a handle may be, in levels per whole length. */
+export const PAN_SLOPE_MAX = 2000;
+/** How many straight pieces one bent stretch of a curve is measured in. */
+const CURVE_STEPS = 32;
+
+/** The level of the stretch from point `a` to point `b` at `t` (0..1 of it): straight, or bent by their handles. */
+function stretchLevel(a, b, t) {
+  const width = b.at - a.at;
+  const line = width > 0 ? (b.level - a.level) / width : 0;
+  const ma = Number.isFinite(a.slope) ? a.slope : line;
+  const mb = Number.isFinite(b.slope) ? b.slope : line;
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const level = (2 * t3 - 3 * t2 + 1) * a.level + (t3 - 2 * t2 + t) * width * ma + (-2 * t3 + 3 * t2) * b.level + (t3 - t2) * width * mb;
+  return Math.min(100, Math.max(0, level));
 }
 
-/** `raw` as a usable curve (numbers kept), or null when it is not one: 2 to 12 points in order from 0 to 1, levels 0..100, mean level at least 5. */
+const tableCache = new WeakMap();
+
+/**
+ * The curve as straight pieces: `xs` and `levels` of their ends and `sums`, the area under it up to each. A stretch
+ * between two points without handles is one piece (exact); a bent one is CURVE_STEPS pieces.
+ */
+export function curveTable(curve) {
+  let table = tableCache.get(curve);
+  if (table) return table;
+  const xs = [curve[0].at];
+  const levels = [curve[0].level];
+  for (let i = 1; i < curve.length; i++) {
+    const a = curve[i - 1];
+    const b = curve[i];
+    const bent = (Number.isFinite(a.slope) || Number.isFinite(b.slope)) && b.at > a.at;
+    const steps = bent ? CURVE_STEPS : 1;
+    for (let k = 1; k <= steps; k++) {
+      xs.push(k === steps ? b.at : a.at + ((b.at - a.at) * k) / steps);
+      levels.push(k === steps ? b.level : stretchLevel(a, b, k / steps));
+    }
+  }
+  const sums = [0];
+  for (let j = 1; j < xs.length; j++) sums.push(sums[j - 1] + ((levels[j] + levels[j - 1]) / 2) * (xs[j] - xs[j - 1]));
+  table = { xs, levels, sums };
+  tableCache.set(curve, table);
+  return table;
+}
+
+/** The area under the speed `curve` over 0..1: its mean level. */
+export function panCurveMean(curve) {
+  return curveTable(curve).sums.at(-1);
+}
+
+/** `raw` as a usable curve (numbers kept, a handle's slope held to ±PAN_SLOPE_MAX), or null when it is not one: 2 to 12 points in order from 0 to 1, levels 0..100, mean level at least 5. */
 export function sanitizePanCurve(raw) {
   if (!Array.isArray(raw) || raw.length < PAN_CURVE_POINTS[0] || raw.length > PAN_CURVE_POINTS[1]) return null;
-  const curve = raw.map((point) => ({ at: Number(point?.at), level: Number(point?.level) }));
+  const curve = raw.map((point) => {
+    const slope = Number(point?.slope);
+    return {
+      at: Number(point?.at),
+      level: Number(point?.level),
+      ...(point?.slope != null && Number.isFinite(slope) ? { slope: Math.min(PAN_SLOPE_MAX, Math.max(-PAN_SLOPE_MAX, slope)) } : {}),
+    };
+  });
   if (!curve.every((point) => Number.isFinite(point.at) && Number.isFinite(point.level) && point.level >= 0 && point.level <= 100)) return null;
   if (curve[0].at !== 0 || curve.at(-1).at !== 1) return null;
   if (curve.some((point, i) => i > 0 && point.at < curve[i - 1].at)) return null;
@@ -245,8 +300,6 @@ export function transitionFovs(from, to, p) {
   return { from: own(from), to: own(to) };
 }
 
-const progressCache = new WeakMap();
-
 /**
  * How far along the yaw (and everything else) a pan is at `x` of its length:
  * the area under the speed curve up to x over its whole area. Without a curve
@@ -254,23 +307,15 @@ const progressCache = new WeakMap();
  */
 export function panProgress(curve, x) {
   if (!curve) return easeInOut(x);
-  let sums = progressCache.get(curve);
-  if (!sums) {
-    sums = [0];
-    for (let i = 1; i < curve.length; i++) sums.push(sums[i - 1] + ((curve[i].level + curve[i - 1].level) / 2) * (curve[i].at - curve[i - 1].at));
-    progressCache.set(curve, sums);
-  }
-  const total = sums.at(-1);
   if (x <= 0) return 0;
   if (x >= 1) return 1;
-  let i = 1;
-  while (i < curve.length - 1 && curve[i].at <= x) i++;
-  const a = curve[i - 1];
-  const b = curve[i];
-  const width = b.at - a.at;
-  const d = x - a.at;
-  const slope = width > 0 ? (b.level - a.level) / width : 0;
-  return (sums[i - 1] + a.level * d + (slope * d * d) / 2) / total;
+  const { xs, levels, sums } = curveTable(curve);
+  let j = 1;
+  while (j < xs.length - 1 && xs[j] <= x) j++;
+  const width = xs[j] - xs[j - 1];
+  const d = x - xs[j - 1];
+  const slope = width > 0 ? (levels[j] - levels[j - 1]) / width : 0;
+  return (sums[j - 1] + levels[j - 1] * d + (slope * d * d) / 2) / sums.at(-1);
 }
 
 /**

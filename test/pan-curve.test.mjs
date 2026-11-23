@@ -181,3 +181,30 @@ test('rendered yaw pans: the default curve is the pan it always was, a direction
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('a point with a handle bends the curve through it at its slope; points without one keep the straight lines', () => {
+  const line = [{ at: 0, level: 0 }, { at: 0.5, level: 100 }, { at: 1, level: 0 }];
+  // Flat at the top: the curve rounds over the peak and holds more area than the sharp tent.
+  const round = [{ at: 0, level: 0 }, { at: 0.5, level: 100, slope: 0 }, { at: 1, level: 0 }];
+  assert.equal(panCurveMean(line), 50);
+  assert.ok(panCurveMean(round) > 55 && panCurveMean(round) < 65, `mean ${panCurveMean(round)}`);
+  // Symmetric: half the way at half the length; always moving forward, ending on 1.
+  assert.ok(Math.abs(panProgress(round, 0.5) - 0.5) < 1e-9);
+  let last = 0;
+  for (let i = 1; i <= 100; i++) {
+    const p = panProgress(round, i / 100);
+    assert.ok(p >= last, `x=${i / 100}`);
+    last = p;
+  }
+  assert.equal(last, 1);
+  // A longer mean is a shorter pan.
+  assert.ok(panOf(plan({ panCurve: round })).dur < panOf(plan({ panCurve: line })).dur);
+});
+
+test('a handle is kept through the cut (held to ±2000); a bad one is dropped, the point stays', () => {
+  const edl = sanitizeEdl([
+    { t: 0, camera: 1 },
+    { t: 5, camera: 2, panSpeed: 10, panCurve: [{ at: 0, level: 0, slope: 9999 }, { at: 0.5, level: 100, slope: 0 }, { at: 1, level: 0, slope: 'x' }] },
+  ]);
+  assert.deepEqual(edl[1].panCurve, [{ at: 0, level: 0, slope: 2000 }, { at: 0.5, level: 100, slope: 0 }, { at: 1, level: 0 }]);
+});
