@@ -8,7 +8,7 @@ import {
   bulgeOf, bulgeReach, fieldOfView, frameWarp, hasBulge, panniniSide, projectedFieldOfView, projectionStage, radial, radialInverse,
   sameBulge, strengthCurves, strengthOf, strengthWarp, STRENGTH_REACH_MAX,
 } from '../src/formats.js';
-import { fixedZoom, renderFromEdl, samePicture, transitionFovs } from '../src/edl.js';
+import { fixedZoom, renderFromEdl, samePicture, transitionLayers } from '../src/edl.js';
 
 // ---------------------------------------------------------------- strength maths
 test('the curve family: tan for k > 0, sin for k < 0, the plain angle at 0; each inverse undoes it', () => {
@@ -59,8 +59,10 @@ test('the strength is part of the shape: kept when not 0, needs the warp, makes 
   // A zoom change on a bent fisheye is not a plain pan; without the strength it is.
   assert.equal(samePicture(bent, { ...bent, fov: 140 }), false);
   assert.equal(samePicture({ ...bent, bulge: null }, { ...bent, fov: 140, bulge: null }), true);
-  // In a transition a bent picture keeps its own zoom.
-  assert.equal(transitionFovs(bent, { projection: 'flat', fov: 90, bulge: null }, 0.5).from, 160);
+  // In a transition a bent picture keeps its camera's zoom and, like any other, gets a frame zoom to meet the other one.
+  const [under] = transitionLayers({ ...bent, mix: { projection: 'flat', fov: 90, bulge: null, p: 0.5 } }, { hfov: 100, vfov: 56 });
+  assert.equal(under.fov, 160);
+  assert.ok(under.zoom[0] < 1 && under.zoom[1] < 1);
 });
 
 test('a strength widens what v360 draws as far as the frame reaches, never past STRENGTH_REACH_MAX', () => {

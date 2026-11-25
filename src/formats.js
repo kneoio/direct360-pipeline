@@ -519,3 +519,67 @@ function widenFov(kind, fov, k) {
   if (kind === 'fisheye') return Math.min(360, fov * k);
   return Math.min(359, (4 * Math.atan(k * Math.tan((Math.min(fov, 359) * r) / 4))) / r);
 }
+
+const RAD = Math.PI / 180;
+
+/** The frame's shape as the web editor measures it: its fov at 100° across the long side (lens.js `base`). */
+export const frameBase = (width, height) => fieldOfView(width, height, 100);
+
+/**
+ * The side of the square v360 draws for a pannini frame, in frame widths (`q` is the frame's height over its width),
+ * unrounded: the web editor's lens.js panniniSide (panniniSide above is the same in whole pixels).
+ */
+export const panniniSideUnits = (q, fov) => Math.max((Math.max(1, q) * PANNINI_EDGE) / Math.sin((Math.min(fov, 170) / 2) * RAD), 1, q);
+
+/**
+ * The direction (unit, x right, y up, z ahead) under a point (u, v) of a camera's frame, each -1..1 across the frame,
+ * before the camera's aim: the web editor's lens.js frameVector (and its frameDirection for flat), `base` the frame's
+ * frameBase. Flat is rectilinear; fisheye is equidistant; planet stereographic; pannini v360's (x with the sine of
+ * longitude, y with the tangent of latitude); each bent by `strength` along strengthCurves.
+ */
+export function frameVector(projection, u, v, base, fov, strength = 0) {
+  const kind = projectionOf(projection);
+  if (kind === 'flat') {
+    const k = fov / Math.max(base.hfov, base.vfov);
+    const x = u * Math.tan(((base.hfov * k) / 2) * RAD);
+    const y = v * Math.tan(((base.vfov * k) / 2) * RAD);
+    const n = Math.hypot(x, y, 1);
+    return [x / n, y / n, 1 / n];
+  }
+  const [k, kv] = strengthCurves(kind, strength, fov);
+  if (kind === 'pannini') {
+    const q = base.vfov / base.hfov;
+    const r = panniniSideUnits(q, fov);
+    const lon = radialInverse(k, (Math.min(r, Math.max(-r, u)) / r) * radial(k, PANNINI_EDGE_LON));
+    const lat = radialInverse(kv, (Math.min(r / q, Math.max(-r / q, v)) * q) / r);
+    return [Math.cos(lat) * Math.sin(lon), Math.sin(lat), Math.cos(lat) * Math.cos(lon)];
+  }
+  const wide = base.hfov >= base.vfov;
+  const s = wide ? base.vfov / base.hfov : base.hfov / base.vfov;
+  const x = u * (wide ? 1 : s);
+  const y = v * (wide ? s : 1);
+  const rho = Math.hypot(x, y);
+  const phi = Math.atan2(y, x);
+  const off = radialInverse(k, rho * radial(k, (fov / 2) * RAD));
+  return [Math.sin(off) * Math.cos(phi), Math.sin(off) * Math.sin(phi), Math.cos(off)];
+}
+
+/**
+ * How much room a camera's picture has left at a point (u, v) of its frame: the web editor's lens.js frameRoom. 1 or
+ * so well inside, 0 where its curve runs out (a sin-like strength reaches its last angle, pannini's square ends), less
+ * past it. Flat and the tan-like curves never run out; a camera's own frame always has room.
+ */
+export function frameRoom(projection, u, v, base, fov, strength = 0) {
+  const kind = projectionOf(projection);
+  if (kind === 'flat') return 1;
+  const [k] = strengthCurves(kind, strength, fov);
+  if (kind === 'pannini') {
+    const q = base.vfov / base.hfov;
+    const r = panniniSideUnits(q, fov);
+    return Math.min(1 - Math.abs(u) / r, 1 - (Math.abs(v) * q) / r);
+  }
+  if (k >= -1e-4) return 1;
+  const wide = base.hfov >= base.vfov;
+  const s = wide ? base.vfov / base.hfov : base.hfov / base.vfov;
+  return 1 + k * Math.hypot(u * (wide ? 1 : s), v * (wide ? s : 1)) * radial(k, (fov / 2) * RAD);
+}
