@@ -1235,14 +1235,33 @@ async function renderYawPan(src, out, {
 }
 
 /**
+ * The sendcmd lines of a pitch-, roll- or fov-changing pan over `frames` frames: on every frame the yaw step to the
+ * next (scroll) and each channel that moves (`pitchMoves`, `rollMoves`, `fovMoves`), at its pose (`poseAt(n)`) and
+ * view (`viewAt(pose)`). Every frame has its own tilt: sending it on every other frame showed each tilt twice.
+ */
+export function pitchPanCommands(poseAt, viewAt, frames, { num, den, pitchMoves, rollMoves, fovMoves }) {
+  const lines = [];
+  for (let n = 0; n < frames; n++) {
+    const pose = poseAt(n);
+    const parts = [];
+    if (n < frames - 1) parts.push(`scroll horizontal ${((poseAt(n + 1).unwrapped - pose.unwrapped) / 360).toFixed(8)}`);
+    if (pitchMoves) parts.push(`v360 pitch ${pose.pitch.toFixed(6)}`);
+    if (rollMoves) parts.push(`v360 roll ${pose.roll.toFixed(6)}`);
+    if (fovMoves) {
+      const view = viewAt(pose);
+      parts.push(`v360 h_fov ${view.hfov.toFixed(6)}`, `v360 v_fov ${view.vfov.toFixed(6)}`);
+    }
+    if (parts.length) lines.push(`${seekTimestamp(n, num, den)} ${parts.join(', ')};`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+/**
  * Pitch-, roll- or fov-changing pan: one ffmpeg for the chunk. Yaw uses the
  * same scroll steps as a yaw-only pan (a spin of the equirect is the same
  * for any roll and fov, which sit inside the v360). Pitch, roll and fov are
- * absolute sendcmd values (`reset_rot=1`, so v360 does not accumulate them).
- * v360 rebuilds its remap on every such command. A pitch-only pan sends
- * pitch on every other frame, which halves those rebuilds. Once roll or fov
- * moves too, every frame gets its own pose so the tilt and the zoom are
- * smooth; only the channels that actually move are sent. interp=linear is the
+ * absolute sendcmd values (`reset_rot=1`, so v360 does not accumulate them),
+ * sent on every frame (pitchPanCommands). interp=linear is the
  * cheaper sampler. Output size is the v360 size. The seek is the same
  * half-frame timestamp as a hold.
  */
@@ -1256,32 +1275,12 @@ async function renderPitchPan(src, out, {
   const pitchMoves = Math.abs((toPitch ?? 0) - (fromPitch ?? 0)) > SAME;
   const rollMoves = Math.abs(normalizeAngle(toRoll - fromRoll)) > SAME;
   const fovMoves = Math.abs(toFov - fromFov) > SAME;
-  const everyFrame = rollMoves || fovMoves;
   const poseAt = (n) => panPose(fromYaw, toYaw, fromPitch, toPitch, index0 + n, panFrames, extra);
   const viewAt = (pose) => panFieldOfView(width, height, fromFov, toFov, pose.p, projection, bulge);
   const pose0 = poseAt(0);
   const view0 = viewAt(pose0);
   const cmdFile = path.join(tmp, `pitch-${chunkIndex}.cmd`);
-  const lines = [];
-  for (let n = 0; n < frames; n++) {
-    const pose = poseAt(n);
-    const parts = [];
-    if (everyFrame || n % 2 === 0 || n === frames - 1) {
-      if (pitchMoves) parts.push(`v360 pitch ${pose.pitch.toFixed(6)}`);
-      if (rollMoves) parts.push(`v360 roll ${pose.roll.toFixed(6)}`);
-      if (fovMoves) {
-        const view = viewAt(pose);
-        parts.push(`v360 h_fov ${view.hfov.toFixed(6)}`, `v360 v_fov ${view.vfov.toFixed(6)}`);
-      }
-    }
-    if (n < frames - 1) {
-      const next = poseAt(n + 1);
-      const step = (next.unwrapped - pose.unwrapped) / 360;
-      parts.unshift(`scroll horizontal ${step.toFixed(8)}`);
-    }
-    if (parts.length) lines.push(`${seekTimestamp(n, num, den)} ${parts.join(', ')};`);
-  }
-  fs.writeFileSync(cmdFile, `${lines.join('\n')}\n`);
+  fs.writeFileSync(cmdFile, pitchPanCommands(poseAt, viewAt, frames, { num, den, pitchMoves, rollMoves, fovMoves }));
   const shift = frames > 1 ? `sendcmd=f='${filterPath(cmdFile)}',scroll=horizontal=0:hpos=0,` : `sendcmd=f='${filterPath(cmdFile)}',`;
   const chain = withOverlay(`setpts=PTS-STARTPTS,${shift}${v360Filter(pose0.yaw, pose0.pitch, view0.hfov, view0.vfov, width, height, { resetRot: true, interp: 'linear', roll: pose0.roll, projection, fov: fromFov, bulge })},setpts=PTS-STARTPTS`, overlay);
   const args = [
