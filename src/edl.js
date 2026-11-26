@@ -1197,12 +1197,15 @@ async function renderHold(src, out, { start, yaw, pitch, roll = 0, hfov, vfov, p
  */
 async function renderYawPan(src, out, {
   start, frames, index0, panFrames, fromYaw, toYaw, pitch, roll = 0, hfov, vfov, projection, fov, bulge = null, width, height,
-  preset, crf, threads = 2, watermark = false, overlay = null, num, den, ff, tmp, chunkIndex, panCurve, panDirection,
+  preset, crf, threads = 2, watermark = false, overlay = null, num, den, ff, tmp, chunkIndex, panCurve, panDirection, srcW,
 }) {
   const extra = { curve: panCurve, direction: panDirection };
   const pose0 = panPose(fromYaw, toYaw, pitch, pitch, index0, panFrames, extra);
   const cmdFile = path.join(tmp, `scroll-${chunkIndex}.cmd`);
-  let shift = '';
+  const poseAt = (n) => panPose(fromYaw, toYaw, pitch, pitch, index0 + n, panFrames, extra);
+  const blur = blurFilters(panBlurPixels(poseAt, frames, { fps: num / (den || 1), fromFov: fov, toFov: fov, width, height, srcWidth: srcW }), path.join(tmp, `blur-${chunkIndex}.cmd`), { num, den });
+  const aim = blur ? blurScroll(pose0.yaw) : { hpos: 0, yaw: pose0.yaw };
+  let shift = blur ? `scroll=horizontal=0:hpos=${aim.hpos.toFixed(8)},${blur}` : '';
   if (frames > 1) {
     const lines = [];
     for (let n = 0; n < frames - 1; n++) {
@@ -1216,9 +1219,9 @@ async function renderYawPan(src, out, {
     // scroll keeps a fractional-pixel accumulator and emits it when it
     // crosses an integer, so the pan does not drift; the picture steps by
     // at most one source pixel.
-    shift = `sendcmd=f='${filterPath(cmdFile)}',scroll=horizontal=0:hpos=0,`;
+    shift = `sendcmd=f='${filterPath(cmdFile)}',scroll=horizontal=0:hpos=${aim.hpos.toFixed(8)},${blur}`;
   }
-  const chain = withOverlay(`setpts=PTS-STARTPTS,${shift}${v360Filter(pose0.yaw, pose0.pitch, hfov, vfov, width, height, { roll, projection, fov, bulge })},setpts=PTS-STARTPTS`, overlay);
+  const chain = withOverlay(`setpts=PTS-STARTPTS,${shift}${v360Filter(aim.yaw, pose0.pitch, hfov, vfov, width, height, { roll, projection, fov, bulge })},setpts=PTS-STARTPTS`, overlay);
   const args = [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-threads', String(threads),
@@ -1257,6 +1260,69 @@ export function pitchPanCommands(poseAt, viewAt, frames, { num, den, pitchMoves,
 }
 
 /**
+ * Motion blur of a fast pan, the web editor's rule (plan.js panBlurOf): a pan turning more than BLUR_FROM frame widths a
+ * second smears the picture sideways by how far it turns past that in BLUR_EXPOSURE seconds. Only the side-to-side
+ * turn (yaw) blurs: the 360 picture is blurred across before the camera is drawn from it (a turn of the world is a
+ * sideways shift of the 360 picture), never in a transition.
+ */
+export const BLUR_FROM = 0.5;
+export const BLUR_EXPOSURE = 1 / 60;
+
+/** Degrees of yaw a picture `across` degrees wide smears by when it turns at `speed` degrees a second. */
+export const panBlurOf = (speed, across) => Math.max(0, Math.abs(speed) - BLUR_FROM * across) * BLUR_EXPOSURE;
+
+/** About how many degrees of yaw a camera of `fov` (across the long side) spans across a `width` x `height` frame. */
+export function frameAcross(fov, width, height) {
+  const base = frameBase(width, height);
+  return base.hfov >= base.vfov ? fov : (fov * base.hfov) / base.vfov;
+}
+
+/**
+ * The blur of each frame of a pan chunk, in pixels across a 360 picture `srcWidth` wide: from the turn to the next
+ * frame (`poseAt(n)`: panPose, its `unwrapped` yaw and `p`) at `fps`, the camera's fov going from `fromFov` to `toFov`.
+ */
+export function panBlurPixels(poseAt, frames, { fps, fromFov, toFov, width, height, srcWidth }) {
+  const out = [];
+  for (let n = 0; n < frames; n++) {
+    const [a, b] = n < frames - 1 ? [poseAt(n), poseAt(n + 1)] : [poseAt(Math.max(0, n - 1)), poseAt(n)];
+    const speed = (b.unwrapped - a.unwrapped) * fps;
+    const fov = fromFov + (toFov - fromFov) * poseAt(n).p;
+    out.push((panBlurOf(speed, frameAcross(fov, width, height)) / 360) * srcWidth);
+  }
+  return out;
+}
+
+/** gblur's sigma for a sideways smear `px` long (a box that long has this spread). */
+const blurSigma = (px) => px / Math.sqrt(12);
+
+/**
+ * The filters that blur a chunk's 360 picture across by `pxs` (panBlurPixels), from `cmdFile` which this writes:
+ * empty when no frame blurs. The picture is blurred before the camera is drawn; its edges do not wrap, so the caller
+ * keeps them behind the camera (blurScroll).
+ */
+export function blurFilters(pxs, cmdFile, { num, den }) {
+  if (!pxs.some((px) => px > 0)) return '';
+  const lines = [];
+  let last = null;
+  pxs.forEach((px, n) => {
+    const sigma = blurSigma(px).toFixed(3);
+    if (sigma !== last) lines.push(`${seekTimestamp(n, num, den)} gblur@mb sigma ${sigma};`);
+    last = sigma;
+  });
+  fs.writeFileSync(cmdFile, `${lines.join('\n')}\n`);
+  return `sendcmd=f='${filterPath(cmdFile)}',gblur@mb=sigma=${blurSigma(pxs[0]).toFixed(3)}:sigmaV=0:steps=3,`;
+}
+
+/**
+ * Where a blurred pan starts its scroll so the camera looks at the middle of the 360 picture and its edges (which the
+ * blur does not wrap) stay behind it: `hpos` for scroll and the yaw the v360 then has (0). scroll at `hpos` turns the
+ * world so a v360 at yaw y shows what y + 360 * hpos showed.
+ */
+export function blurScroll(yaw) {
+  return { hpos: (((-yaw / 360) % 1) + 1) % 1, yaw: 0 };
+}
+
+/**
  * Pitch-, roll- or fov-changing pan: one ffmpeg for the chunk. Yaw uses the
  * same scroll steps as a yaw-only pan (a spin of the equirect is the same
  * for any roll and fov, which sit inside the v360). Pitch, roll and fov are
@@ -1269,7 +1335,7 @@ async function renderPitchPan(src, out, {
   start, frames, index0, panFrames, fromYaw, toYaw, fromPitch, toPitch,
   fromRoll = 0, toRoll = 0, fromFov = FOV_DEFAULT, toFov = FOV_DEFAULT, projection = 'flat', bulge = null,
   width, height, preset, crf, threads = 2, watermark = false, overlay = null,
-  num, den, ff, tmp, chunkIndex, panCurve, panDirection,
+  num, den, ff, tmp, chunkIndex, panCurve, panDirection, srcW,
 }) {
   const extra = { fromRoll, toRoll, fromFov, toFov, curve: panCurve, direction: panDirection };
   const pitchMoves = Math.abs((toPitch ?? 0) - (fromPitch ?? 0)) > SAME;
@@ -1281,8 +1347,10 @@ async function renderPitchPan(src, out, {
   const view0 = viewAt(pose0);
   const cmdFile = path.join(tmp, `pitch-${chunkIndex}.cmd`);
   fs.writeFileSync(cmdFile, pitchPanCommands(poseAt, viewAt, frames, { num, den, pitchMoves, rollMoves, fovMoves }));
-  const shift = frames > 1 ? `sendcmd=f='${filterPath(cmdFile)}',scroll=horizontal=0:hpos=0,` : `sendcmd=f='${filterPath(cmdFile)}',`;
-  const chain = withOverlay(`setpts=PTS-STARTPTS,${shift}${v360Filter(pose0.yaw, pose0.pitch, view0.hfov, view0.vfov, width, height, { resetRot: true, interp: 'linear', roll: pose0.roll, projection, fov: fromFov, bulge })},setpts=PTS-STARTPTS`, overlay);
+  const blur = blurFilters(panBlurPixels(poseAt, frames, { fps: num / (den || 1), fromFov, toFov, width, height, srcWidth: srcW }), path.join(tmp, `blur-${chunkIndex}.cmd`), { num, den });
+  const aim = blur ? blurScroll(pose0.yaw) : { hpos: 0, yaw: pose0.yaw };
+  const shift = frames > 1 || blur ? `sendcmd=f='${filterPath(cmdFile)}',scroll=horizontal=0:hpos=${aim.hpos.toFixed(8)},${blur}` : `sendcmd=f='${filterPath(cmdFile)}',`;
+  const chain = withOverlay(`setpts=PTS-STARTPTS,${shift}${v360Filter(aim.yaw, pose0.pitch, view0.hfov, view0.vfov, width, height, { resetRot: true, interp: 'linear', roll: pose0.roll, projection, fov: fromFov, bulge })},setpts=PTS-STARTPTS`, overlay);
   const args = [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-threads', String(threads),
@@ -1712,15 +1780,23 @@ export function stabilizedCommands(angles, { num, den, rotStep = 1, target = 'v3
 
 async function renderStabilized(src, out, {
   start, frames, angles, hfov, vfov, views = null, projection = 'flat', fov = FOV_DEFAULT, bulge = null, width, height, preset, crf, threads = 2, watermark = false, overlay = null,
-  num, den, ff, tmp, chunkIndex, rotStep = 1,
+  num, den, ff, tmp, chunkIndex, rotStep = 1, blurPx = null,
 }) {
   const cmdFile = path.join(tmp, `stab-${chunkIndex}.cmd`);
+  // A fast pan's blur (blurPx: panBlurPixels): the 360 picture turned so the middle of the pan's aim sits in its middle.
+  const blur = blurPx ? blurFilters(blurPx, path.join(tmp, `blur-${chunkIndex}.cmd`), { num, den }) : '';
+  let shift = '';
+  if (blur) {
+    const { hpos } = blurScroll(angles[Math.floor(angles.length / 2)].yaw);
+    angles = angles.map((a) => ({ ...a, yaw: normalizeAngle(a.yaw + 360 * hpos) }));
+    shift = `scroll=horizontal=0:hpos=${hpos.toFixed(8)},${blur}`;
+  }
   fs.writeFileSync(cmdFile, stabilizedCommands(angles, { num, den, rotStep, views }));
   const a0 = angles[0];
   if (views) ({ hfov, vfov } = views[0]);
   const stage = projectionStage(projection, width, height, fov, bulge);
   const v360 = `v360@s=input=e:output=${stage.output}:yaw=${a0.yaw.toFixed(4)}:pitch=${a0.pitch.toFixed(4)}:roll=${a0.roll.toFixed(4)}:h_fov=${hfov}:v_fov=${vfov}:w=${stage.w}:h=${stage.h}:reset_rot=1${stage.post}`;
-  const chain = withOverlay(`setpts=PTS-STARTPTS,sendcmd=f='${filterPath(cmdFile)}',${v360},setpts=PTS-STARTPTS`, overlay);
+  const chain = withOverlay(`setpts=PTS-STARTPTS,sendcmd=f='${filterPath(cmdFile)}',${shift}${v360},setpts=PTS-STARTPTS`, overlay);
   const args = [
     '-hide_banner', '-loglevel', 'error', '-y',
     '-threads', String(threads),
@@ -2053,6 +2129,9 @@ export async function renderFromEdl(src, out, edl, {
           ? Array.from({ length: seg.frames }, (_, n) => panFieldOfView(width, height, seg.fromFov, seg.toFov, pose(n).p, seg.projection, seg.bulge))
           : null,
         rotStep: zoomMoves ? 1 : (stabilization.rotStep || 1),
+        blurPx: seg.type === 'pan'
+          ? panBlurPixels(pose, seg.frames, { fps: num / (den || 1), fromFov: seg.fromFov ?? FOV_DEFAULT, toFov: seg.toFov ?? FOV_DEFAULT, width, height, srcWidth: videoStream.width })
+          : null,
         tmp,
         chunkIndex: i,
       });
@@ -2063,6 +2142,7 @@ export async function renderFromEdl(src, out, edl, {
     } else if (seg.yawOnly && !preview) {
       await renderYawPan(src, file, {
         ...shared,
+        srcW: videoStream.width,
         fromYaw: seg.fromYaw,
         toYaw: seg.toYaw,
         pitch: seg.fromPitch ?? 0,
@@ -2087,6 +2167,7 @@ export async function renderFromEdl(src, out, edl, {
     } else {
       await renderPitchPan(src, file, {
         ...shared,
+        srcW: videoStream.width,
         fromYaw: seg.fromYaw,
         toYaw: seg.toYaw,
         fromPitch: seg.fromPitch ?? 0,
