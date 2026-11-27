@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const IMPORT = /(?:^|\n)\s*(?:import|export)\s[^'"\n]*?from\s*['"](\.[^'"]+)['"]|import\(\s*['"](\.[^'"]+)['"]\s*\)|(?:^|\n)\s*import\s*['"](\.[^'"]+)['"]/g;
+const IMPORT = /(?:^|\n)\s*(?:import|export)\s[^'"\n]*?from\s*['"](\.[^'"]+)['"]|import\(\s*['"](\.[^'"]+)['"]\s*\)|(?:^|\n)\s*import\s*['"](\.[^'"]+)['"]|new URL\(\s*['"](\.[^'"]+\.js)['"]\s*,\s*import\.meta\.url\s*\)/g;
 
 /** First 10 hex of sha256 over the files (sorted by path): each path relative to `root`, then its bytes. */
 export function hashFiles(files, root = ROOT) {
@@ -32,7 +32,7 @@ export function importedFiles(entry) {
     if (!file.endsWith('.js')) return;
     const text = fs.readFileSync(file, 'utf8');
     for (const match of text.matchAll(IMPORT)) {
-      const spec = match[1] || match[2] || match[3];
+      const spec = match[1] || match[2] || match[3] || match[4];
       const target = path.resolve(path.dirname(file), spec);
       if (fs.existsSync(target) && fs.statSync(target).isFile()) visit(target);
     }

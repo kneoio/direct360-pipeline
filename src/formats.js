@@ -564,22 +564,3 @@ export function frameVector(projection, u, v, base, fov, strength = 0) {
   return [Math.sin(off) * Math.cos(phi), Math.sin(off) * Math.sin(phi), Math.cos(off)];
 }
 
-/**
- * How much room a camera's picture has left at a point (u, v) of its frame: the web editor's lens.js frameRoom. 1 or
- * so well inside, 0 where its curve runs out (a sin-like strength reaches its last angle, pannini's square ends), less
- * past it. Flat and the tan-like curves never run out; a camera's own frame always has room.
- */
-export function frameRoom(projection, u, v, base, fov, strength = 0) {
-  const kind = projectionOf(projection);
-  if (kind === 'flat') return 1;
-  const [k] = strengthCurves(kind, strength, fov);
-  if (kind === 'pannini') {
-    const q = base.vfov / base.hfov;
-    const r = panniniSideUnits(q, fov);
-    return Math.min(1 - Math.abs(u) / r, 1 - (Math.abs(v) * q) / r);
-  }
-  if (k >= -1e-4) return 1;
-  const wide = base.hfov >= base.vfov;
-  const s = wide ? base.vfov / base.hfov : base.hfov / base.vfov;
-  return 1 + k * Math.hypot(u * (wide ? 1 : s), v * (wide ? s : 1)) * radial(k, (fov / 2) * RAD);
-}

@@ -83,6 +83,80 @@ export function run(bin, args, { capture = true, binary = false, onProgress, onO
   });
 }
 
+/**
+ * Two ffmpegs joined through this process: `decode` writes raw frames of `frameIn` bytes to its stdout, `draw(frame, n)`
+ * turns each into a frame of `frameOut` bytes (sync or async), and `encode` reads those from its stdin. The decoder
+ * waits while a frame is drawn (its pipe fills and it blocks), so nothing piles up in memory. Resolves when the encoder
+ * has finished; stopping (`signal`) or either ffmpeg failing stops both, with the same errors as run.
+ */
+export function runPiped(bin, { decode, encode, frameIn, frameOut, draw }, { signal } = {}) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const err = new Error('stopped');
+      err.name = 'AbortError';
+      reject(err);
+      return;
+    }
+    const dec = spawn(bin, decode, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const enc = spawn(bin, encode, { stdio: ['pipe', 'ignore', 'pipe'] });
+    const errs = { dec: '', enc: '' };
+    dec.stderr.on('data', (d) => { errs.dec += d; });
+    enc.stderr.on('data', (d) => { errs.enc += d; });
+    let failed = null;
+    const fail = (error) => {
+      if (failed) return;
+      failed = error;
+      for (const p of [dec, enc]) {
+        try { p.kill('SIGINT'); } catch { /* already gone */ }
+        const kill = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* already gone */ } }, 2000);
+        kill.unref?.();
+      }
+      reject(error);
+    };
+    const onAbort = () => {
+      const err = new Error('stopped');
+      err.name = 'AbortError';
+      fail(err);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const exitError = (name, c, closeSignal) => {
+      if (c === null && closeSignal === 'SIGKILL') {
+        const error = new Error(`${bin} (${name}) was killed by SIGKILL (likely out of memory)\n${errs[name]}`);
+        error.oom = true;
+        return error;
+      }
+      return new Error(`${bin} (${name}) ${c === null ? `was killed by ${closeSignal}` : `exited ${c}`}\n${errs[name]}`);
+    };
+    dec.on('error', fail);
+    enc.on('error', fail);
+    enc.stdin.on('error', (e) => { if (!failed) fail(e); });
+    dec.on('close', (c, closeSignal) => { if (c !== 0 && !failed) fail(exitError('dec', c, closeSignal)); });
+    enc.on('close', (c, closeSignal) => {
+      signal?.removeEventListener('abort', onAbort);
+      if (failed) return;
+      if (c === 0) resolve();
+      else fail(exitError('enc', c, closeSignal));
+    });
+    (async () => {
+      let pending = Buffer.alloc(0);
+      let n = 0;
+      for await (const chunk of dec.stdout) {
+        if (failed) return;
+        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+        while (pending.length >= frameIn) {
+          const frame = pending.subarray(0, frameIn);
+          pending = pending.subarray(frameIn);
+          const out = await draw(Buffer.from(frame), n++);
+          if (out.length !== frameOut) throw new Error(`a drawn frame is ${out.length} bytes, not ${frameOut}`);
+          if (!enc.stdin.write(out)) await new Promise((r) => enc.stdin.once('drain', r));
+          if (failed) return;
+        }
+      }
+      enc.stdin.end();
+    })().catch((e) => fail(e));
+  });
+}
+
 export async function probe(file) {
   const out = await run(FFPROBE, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file]);
   return JSON.parse(out);

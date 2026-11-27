@@ -6,10 +6,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-  MATCH_AT, PAN_KINDS, PLANET_FADE, ROOM_FADE, TRANSITION_MIN, frameAlpha, panProgress, panYawDelta, planSegments, renderFromEdl, sanitizeEdl,
-  transitionKinds, transitionLayers, transitionMix, transitionPictureLayout, transitionWeight, transitionZooms,
+  MATCH_AT, PAN_KINDS, PLANET_FADE, TRANSITION_MIN, panProgress, panYawDelta, planSegments, renderFromEdl, sanitizeEdl,
+  transitionKinds, transitionLayers, transitionWeight,
 } from '../src/edl.js';
-import { frameVector, strengthOf } from '../src/formats.js';
+import { frameBase, frameVector, strengthOf } from '../src/formats.js';
+import { TRANSITION_REACH, bendFrame, slerpDirection, transitionDirection, transitionPoint } from '../src/morph.js';
 import { CAMERAS, FRAMES, PS, SAME_AIM, transitionCases } from './fixtures/transition-cases.mjs';
 
 // ---------------------------------------------------------------- planning
@@ -42,12 +43,18 @@ test('the new picture fades in along the pan for blend; planet fades only at its
   assert.ok(Math.abs(slope(1e-6)) < 1e-3 && Math.abs(slope(PLANET_FADE - 1e-6)) < 1e-3);
 });
 
-test('per-pixel mix: each picture counted by how much it shows there; where neither does, the weight alone', () => {
-  assert.equal(transitionMix(0.3, 1, 1), 0.3);
-  assert.equal(transitionMix(0.3, 0, 1), 1);
-  assert.equal(transitionMix(0.3, 1, 0), 0);
-  assert.equal(transitionMix(0.3, 0, 0), 0.3);
-  assert.ok(Math.abs(transitionMix(0.5, 0.5, 1) - 2 / 3) < 1e-12);
+test('the bend: a point slides along the sphere by the weight; a round picture holds short of straight behind', () => {
+  const near = (a, b) => a.forEach((x, i) => assert.ok(Math.abs(x - b[i]) < 1e-12, `${a} vs ${b}`));
+  near(slerpDirection([0, 0, 1], [1, 0, 0], 0), [0, 0, 1]);
+  near(slerpDirection([0, 0, 1], [1, 0, 0], 1), [1, 0, 0]);
+  near(slerpDirection([0, 0, 1], [1, 0, 0], 0.5), [Math.SQRT1_2, 0, Math.SQRT1_2]);
+  const base = { hfov: 100, vfov: 56 };
+  // A fisheye of 160 degrees zoomed 3 times reaches 240 degrees off its middle at the frame's side: held at TRANSITION_REACH.
+  const [u] = transitionPoint({ projection: 'fisheye', fov: 160, zoom: [3, 3] }, 1, 0, base);
+  assert.ok(Math.abs(u * 80 * (Math.PI / 180) - TRANSITION_REACH) < 1e-9);
+  // Flat and a planet (a tan-like curve) are never held.
+  assert.deepEqual(transitionPoint({ projection: 'flat', fov: 100, zoom: [5, 5] }, 1, 1, base), [5, 5]);
+  assert.deepEqual(transitionPoint({ projection: 'planet', fov: 260, zoom: [5, 5] }, 1, 1, base), [5, 5]);
 });
 
 test('an edit list keeps a transition kind only with a pan speed', () => {
@@ -83,12 +90,12 @@ test('between two pictures: a plain pan is a cut, a transition the pair allows i
 /**
  * Camera transitions as the render draws them, measured as direct360-web's test/transitions.test.mjs measures its live
  * view: every pair of camera kinds (flat, fisheye, tiny planet, pannini, and the fisheye and planet bent by a strength),
- * each way, in a landscape and a portrait frame. Each picture is its own camera at its frame zoom (transitionLayers),
- * mixed per point by the new one's weight, each counted by how much it shows there (frameAlpha); the picture on screen
- * is followed through the directions both layers show at 600 scattered points:
+ * each way, in a landscape and a portrait frame. The picture is one, bent from the first camera into the second
+ * (morph.js transitionDirection, each camera at its frame zoom from transitionLayers), followed through the direction
+ * it shows at 600 scattered points:
  * - it is still where a pan starts and ends (no jolt from or into a hold);
  * - it never jolts on the way: how fast the picture moves changes by at most 5% of its top speed per 1/400 of the move;
- * - the two pictures lie on each other in the middle of the frame while they mix (within 0.5% of half the frame);
+ * - nothing ever shows twice: it never folds back over itself, and never tears;
  * - a transition takes time even between two cameras aimed the same way.
  */
 const NAMES = Object.keys(CAMERAS);
@@ -141,12 +148,19 @@ function direction(pic, u, v, frame) {
 
 const POINTS = 600;
 const GRID = Array.from({ length: POINTS }, (_, i) => [((0.5 + i * 0.7548776662466927) % 1) * 2 - 1, ((0.5 + i * 0.5698402909980532) % 1) * 2 - 1]);
-const MIDDLE = [];
-for (const u of [-0.1, 0, 0.1]) for (const v of [-0.1, 0, 0.1]) MIDDLE.push(GRID.push([u, v]) - 1);
 const STEPS = 400;
 const angleOf = (a, b) => (Math.acos(Math.max(-1, Math.min(1, a[0] * b[0] + a[1] * b[1] + a[2] * b[2]))) * 180) / Math.PI;
 
-/** The move from `a` to `b` as `kind`, measured at STEPS + 1 even moments (the web test's measure). */
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const dotOf = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const E = 0.01;
+
+/**
+ * The move from `a` to `b` as `kind`, measured at STEPS + 1 even moments (the web test's measure): how fast the bent
+ * picture moves, whether it ever folds back over itself (a mirror image beside the true one: a double image) and how
+ * much it tears (the most degrees between two points E apart, over the most in either camera's own picture).
+ */
 function measure(rig, a, b, kind, frame) {
   const seg = panOf(rig, a, b, kind);
   if (!seg) return null;
@@ -154,7 +168,9 @@ function measure(rig, a, b, kind, frame) {
   const to = pictureOf(rig, b);
   const len = seg.dur;
   const motion = [];
-  let apart = 0;
+  let folds = 0;
+  let tear = 0;
+  let own = 0;
   let prev = null;
   for (let i = 0; i <= STEPS; i++) {
     const p = panProgress(seg.panCurve, Math.min(len - 1e-7, i * (len / STEPS)) / len);
@@ -164,31 +180,36 @@ function measure(rig, a, b, kind, frame) {
       roll: 0,
     };
     const blend = Boolean(seg.blend);
-    const layers = blend ? transitionLayers({ ...from, ...aim, mix: { ...to, ...aim, p } }, frame) : [{ ...from, ...aim }, { ...from, ...aim }];
-    const under = GRID.map(([u, v]) => direction(layers[0], u, v, frame));
-    const over = blend ? GRID.map(([u, v]) => direction(layers[1], u, v, frame)) : under;
+    const layers = blend ? transitionLayers({ ...from, mix: { ...to, p } }, frame) : null;
     const weight = blend ? transitionWeight(seg.blend, seg.projection, p) : 0;
-    const w = GRID.map(([u, v]) => (blend ? transitionMix(weight, frameAlpha(layers[0], u, v, frame), frameAlpha(layers[1], u, v, frame)) : 0));
+    const at = (u, v) => (blend ? transitionDirection(layers, weight, u, v, frame, aim) : direction({ ...from, ...aim }, u, v, frame));
+    const dirs = GRID.map(([u, v]) => at(u, v));
     if (prev) {
       let m = 0;
-      for (let k = 0; k < GRID.length; k++) {
-        m += (1 - w[k]) * angleOf(prev.under[k], under[k]) + w[k] * angleOf(prev.over[k], over[k]) + Math.abs(w[k] - prev.w[k]) * angleOf(under[k], over[k]);
-      }
+      for (let k = 0; k < GRID.length; k++) m += angleOf(prev[k], dirs[k]);
       motion.push(m / GRID.length / (len / STEPS));
     }
-    if (blend) {
-      // How far apart the two pictures show the same thing, in frame units (1 is half the frame).
-      const ahead = direction(layers[0], 0, 0, frame);
-      const size = Math.max(...[[0.05, 0], [0, 0.05]].map(([u, v]) => 0.05 / (angleOf(ahead, direction(layers[0], u, v, frame)) * RAD)));
-      for (const k of MIDDLE) if (w[k] > 0.02 && w[k] < 0.98) apart = Math.max(apart, angleOf(under[k], over[k]) * RAD * size);
+    if (i % 8 === 0 || i === STEPS) {
+      let steep = 0;
+      for (let k = 0; k < GRID.length; k += 3) {
+        const [u, v] = GRID[k];
+        const d = dirs[k];
+        const across = at(u + E, v);
+        const up = at(u, v + E);
+        if (dotOf(cross(sub(across, d), sub(up, d)), d) <= 0) folds++;
+        steep = Math.max(steep, angleOf(d, across) / E, angleOf(d, up) / E);
+      }
+      if (i === 0) own = steep;
+      else if (i === STEPS) own = Math.max(own, steep);
+      else tear = Math.max(tear, steep);
     }
-    prev = { under, over, w };
+    prev = dirs;
   }
   const peak = Math.max(...motion);
   let jolt = 0;
   for (let i = 1; i < motion.length; i++) jolt = Math.max(jolt, Math.abs(motion[i] - motion[i - 1]) / peak);
   const ends = Math.max(...motion.slice(0, 2), ...motion.slice(-2)) / peak;
-  return { len, ends, jolt, apart };
+  return { len, ends, jolt, folds, tear: tear / own };
 }
 
 const MOVES = [];
@@ -225,13 +246,11 @@ test('a transition never jolts: how fast the picture moves changes smoothly all 
   everyMove((m) => (m.jolt > 0.05 ? `its speed jumps by ${(m.jolt * 100).toFixed(0)}% of its top speed in 1/${STEPS} of the move` : null));
 });
 
-test('while two pictures mix, they lie on each other in the middle of the frame (no double image)', () => {
-  // Half a percent of half the frame (about 3 pixels across 1080); a strength-0.6 planet curves so much faster than any
-  // other picture that the two meet within 1% there.
-  everyMove((m, label) => {
-    const most = label.includes('bent planet') ? 0.01 : 0.005;
-    return m.apart > most ? `the two pictures are up to ${(m.apart * 100).toFixed(2)}% of half the frame apart in the middle` : null;
-  });
+test('nothing ever shows twice: the bent picture never folds back over itself, and never tears', () => {
+  // On the way the picture stretches up to about twice what either camera's own picture does at its steepest (a
+  // pannini zoomed against the edge of its square, a bent picture near the last angle of its curve), never several
+  // times as much (a seam).
+  everyMove((m) => (m.folds ? `the picture folds over itself at ${m.folds} points` : m.tear > 3 ? `it tears (${m.tear.toFixed(1)} times either camera's steepest)` : null));
 });
 
 test('a transition takes time even between two cameras aimed the same way at the same zoom', () => {
@@ -269,19 +288,6 @@ test('each picture of a transition is its own camera at the ends: zoom 1 for the
   }
 });
 
-test('a picture fades out ROOM_FADE past the edge of what it can show, and never inside its own frame', () => {
-  const base = FRAMES.landscape;
-  for (const name of NAMES) {
-    const pic = pictureOf(RIG, NAMES.indexOf(name) + 1);
-    for (let i = 0; i <= 20; i++) for (const [u, v] of [[-1 + i / 10, 1], [1, -1 + i / 10], [-1 + i / 10, -1], [-1, -1 + i / 10]]) assert.equal(frameAlpha(pic, u, v, base), 1, name);
-  }
-  const pannini = { projection: 'pannini', fov: 140, zoom: [1.5, 1] };
-  const r = 1.5; // past the pannini square's side (about 1.06 frame widths)
-  assert.ok(frameAlpha(pannini, 1, 0, base) < 1);
-  assert.equal(frameAlpha({ ...pannini, zoom: [r * 2, 1] }, 1, 0, base), 0);
-  assert.equal(ROOM_FADE, 0.25);
-});
-
 // ---------------------------------------------------------------- parity with the web editor
 /** direct360-web's live view for these moves: test/fixtures/web-transitions.json (make-web-transitions.mjs). */
 const WEB = JSON.parse(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/web-transitions.json'), 'utf8'));
@@ -316,22 +322,30 @@ test('… and against a direct360-web checkout beside this one, when there is on
   assertParity(transitionCases(lens, plan), transitionCases(pipelineLens, pipelinePlan));
 });
 
-test('the render zooms each picture along transitionLayers, and only pannini and bent pictures need a canvas', () => {
-  const zooms = transitionZooms({ projection: 'flat', fov: 100 }, { projection: 'planet', fov: 260 }, [0, 0.5, 1], 1920, 1080);
-  assert.deepEqual(zooms[0][0], [1, 1]);
-  assert.deepEqual(zooms[2][1], [1, 1]);
-  const layout = (pic, side = 0) => transitionPictureLayout(pic, zooms.map((z) => z[side]), 1920, 1080);
-  assert.equal(layout({ projection: 'flat', fov: 100 }).mode, 'direct');
-  assert.equal(layout({ projection: 'planet', fov: 260 }, 1).mode, 'direct');
-  const pannini = layout({ projection: 'pannini', fov: 140 });
-  assert.equal(pannini.mode, 'canvas');
-  assert.equal(pannini.fades, true);
-  const bent = layout({ projection: 'fisheye', fov: 180, bulge: { strength: 0.5 } });
-  assert.equal(bent.mode, 'canvas');
-  assert.equal(bent.build, 'remap');
-  for (const l of [pannini, bent]) assert.ok(l.canvas.w <= 4096 && l.canvas.h <= 4096 && l.stage.w <= 4096);
-});
 
+test('… and bends each point of the frame to the same direction as that web editor\'s live view', async (t) => {
+  const webDir = process.env.D360_WEB_DIR || path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../direct360-web');
+  if (!fs.existsSync(path.join(webDir, 'src/editor/lens.js'))) return t.skip('no direct360-web checkout');
+  const lens = await import(pathToFileURL(path.join(webDir, 'src/editor/lens.js')));
+  if (!lens.transitionDirection) return t.skip('that direct360-web predates transitionDirection');
+  let worst = 0;
+  for (const move of MOVES) {
+    const from = pictureOf(RIG, move.a);
+    const to = pictureOf(RIG, move.b);
+    for (const frame of Object.values(FRAMES)) {
+      for (const p of [0.2, 0.5, 0.8]) {
+        const aim = { yaw: 25, pitch: -30, roll: 10 };
+        const weight = transitionWeight(move.kind, from.projection, p);
+        const ours = transitionLayers({ ...from, mix: { ...to, p } }, frame);
+        const web = lens.transitionLayers({ ...from, ...aim, mix: { ...to, ...aim, p } }, frame);
+        for (const [u, v] of GRID.slice(0, 60)) {
+          worst = Math.max(worst, angleOf(transitionDirection(ours, weight, u, v, frame, aim), lens.transitionDirection(web, weight, u, v, frame)));
+        }
+      }
+    }
+  }
+  assert.ok(worst < 1e-4, `up to ${worst} degrees apart`);
+});
 // ---------------------------------------------------------------- real ffmpeg
 function ffmpeg(args) {
   const result = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args], { encoding: 'utf8' });
@@ -394,7 +408,7 @@ for (const [kind, projections, fovs, pitches] of [
       const trace = [];
       await renderFromEdl(src, out, [{ t: 0, camera: 1 }, { t: 2.5, camera: 2, panSpeed: 200, panKind: kind }], { ...base, trace });
       assert.equal(frameCount(out), 90);
-      assert.ok(trace.some((args) => args.some((a) => String(a).includes('blend@m='))), 'the transition mixes two pictures');
+      assert.ok(trace.some((args) => args.includes('rawvideo') && args.includes('pipe:1')), 'the transition is drawn from the decoded frames');
       const firstHold = path.join(tmp, 'a.mp4');
       const lastHold = path.join(tmp, 'b.mp4');
       await renderFromEdl(src, firstHold, [{ t: 0, camera: 1 }], base);
@@ -409,6 +423,29 @@ for (const [kind, projections, fovs, pitches] of [
     });
   });
 }
+
+test('a transition frame is drawn as v360 draws each camera: at either end it is that camera\'s own picture', { timeout: 300000 }, async () => {
+  await withTemp('d360-bend-', async (tmp) => {
+    const src = makeCheckerSource(tmp, 1);
+    const equirect = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', src, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], { maxBuffer: 1 << 28 }).stdout;
+    const [w, h] = [320, 180];
+    const base = frameBase(w, h);
+    for (const [projection, fov, yaw, pitch, roll] of [['flat', 90, -50, -20, 15], ['fisheye', 160, 60, 0, 0], ['planet', 260, 120, -90, 0], ['pannini', 140, -160, 5, 0]]) {
+      const hold = path.join(tmp, `${projection}.mp4`);
+      await renderFromEdl(src, hold, [{ t: 0, camera: 1 }], { format: 'youtube', yaws: [yaw], pitches: [pitch], rolls: [roll], fovs: [fov], projections: [projection], width: w, height: h, log: () => {} });
+      const want = framesOf(hold, w, h)[0];
+      const pic = { projection, fov, bulge: null, zoom: [1, 1] };
+      const other = { projection: projection === 'flat' ? 'planet' : 'flat', fov: 100, bulge: null, zoom: [1, 1] };
+      for (const [layers, weight] of [[[pic, other], 0], [[other, pic], 1]]) {
+        const got = bendFrame(equirect, W, H, Buffer.alloc(w * h * 3), w, h, layers, weight, { yaw, pitch, roll }, base);
+        let se = 0;
+        for (let i = 0; i < got.length; i++) se += (got[i] - want[i]) ** 2;
+        const psnr = 10 * Math.log10((255 * 255) / (se / got.length));
+        assert.ok(psnr >= 28, `${projection} at weight ${weight}: PSNR ${psnr.toFixed(1)}`);
+      }
+    }
+  });
+});
 
 test('a transition renders with a watermark and in a preview too', { timeout: 300000 }, async () => {
   await withTemp('d360-transition-wm-', async (tmp) => {

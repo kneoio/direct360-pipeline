@@ -76,13 +76,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { run, FFMPEG, probe } from './encoder.js';
+import { run, runPiped, FFMPEG, probe } from './encoder.js';
+import { Worker } from 'node:worker_threads';
 import { parseGrid, gridAims, isRearAim } from './matrix.js';
 import { assertOverlayAvailable, withOverlay, filterPath } from './overlayFilter.js';
 import {
-  projectedFieldOfView, projectionOf, projectionStage, outputSize, FORMATS, FOV_DEFAULT, FOV_RANGES, bulgeOf, bulgeReach, hasBulge, sameBulge,
-  strengthOf, strengthCurves, radial, frameBase, frameVector, frameRoom, panniniSideUnits, fieldOfView, bulgeWarp, PROJECTION_V360, PANNINI_FOV,
-  BULGE_SUPERSAMPLE,
+  projectedFieldOfView, projectionOf, projectionStage, outputSize, FORMATS, FOV_DEFAULT, FOV_RANGES, bulgeOf,
+  bulgeReach, hasBulge, sameBulge, strengthOf, frameBase, frameVector, fieldOfView, bulgeWarp, BULGE_SUPERSAMPLE,
 } from './formats.js';
 import { viewAngles } from './stabilize.js';
 import { assertFlatEdl, flatFitFilter } from './flatCameras.js';
@@ -266,8 +266,6 @@ const clamp1 = (x) => Math.min(1, Math.max(-1, x));
 
 /** How far out from the middle (in frame units, 1 is half the frame) a transition's two pictures are matched. */
 export const MATCH_AT = 0.1;
-/** How far past the edge of what a picture can show (frameRoom below 0) it fades out to nothing. */
-export const ROOM_FADE = 0.25;
 
 /** The angle (radians) off the middle that a camera's picture shows MATCH_AT out across (axis 0) or up (axis 1), at frame zoom `z`. */
 function matchAngle(pic, base, axis, z) {
@@ -304,23 +302,6 @@ export function transitionLayers(pose, base) {
     return [p <= 0 ? 1 : zoomForAngle(under, base, axis, angle), p >= 1 ? 1 : zoomForAngle(mix, base, axis, angle)];
   });
   return [{ ...under, zoom: [zooms[0][0], zooms[1][0]] }, { ...mix, zoom: [zooms[0][1], zooms[1][1]] }];
-}
-
-/**
- * How much a transition's picture (with its `zoom`) shows at a point (u, v) of the frame: all of it where it has room
- * (frameRoom), fading to nothing ROOM_FADE past its edge (the web editor's lens.js frameAlpha).
- */
-export function frameAlpha(pic, u, v, base) {
-  const z = pic.zoom ?? [1, 1];
-  const room = frameRoom(pic.projection, u * z[0], v * z[1], base, pic.fov, strengthOf(pic.bulge));
-  return Math.min(1, Math.max(0, 1 + room / ROOM_FADE));
-}
-
-/** How a transition mixes at one point: the new picture's share, each picture counted by how much it shows there. */
-export function transitionMix(weight, alpha0, alpha1) {
-  const w0 = (1 - weight) * alpha0;
-  const w1 = weight * alpha1;
-  return w0 + w1 < 1e-4 ? weight : w1 / (w0 + w1);
 }
 
 /**
@@ -597,7 +578,7 @@ async function runPooled(count, pool, fn) {
  * optional hard cap on the number of processes.
  */
 export function createFfmpegLimiter({ budget, costs, maxParallel = null, signal, exec, measureRss } = {}) {
-  const start = exec || ((args) => run(FFMPEG, args, { signal }));
+  const start = exec || ((args) => runFfmpeg(args, { signal }));
   const readRss = measureRss || (() => 0);
   let used = 0;
   let active = 0;
@@ -1367,396 +1348,59 @@ async function renderPitchPan(src, out, {
 }
 
 /**
- * The v360 h_fov/v_fov of a picture of `kind` drawn over a frame `zoom` ([across, up]) times larger in its own
- * coordinates than `view` (projectedFieldOfView): flat by the tangent of half the angle, fisheye (equidistant) by the
- * angle, planet (stereographic) by the tangent of a quarter of it.
- */
-export function zoomedView(kind, view, zoom) {
-  const one = (fov, z) => {
-    if (kind === 'flat') return (2 * Math.atan(z * Math.tan((fov * RAD) / 2))) / RAD;
-    if (kind === 'fisheye') return fov * z;
-    return (4 * Math.atan(z * Math.tan((Math.min(fov, 359) * RAD) / 4))) / RAD;
-  };
-  return { hfov: one(view.hfov, zoom[0]), vfov: one(view.vfov, zoom[1]) };
-}
-
-/** The largest side of a picture drawn larger than the frame for a transition (its canvas), in pixels. */
-const CANVAS_MAX = 4096;
-const evenUp = (n) => Math.max(2, Math.ceil(n / 2) * 2);
-
-/** A shape without its strength: the bows, corner and side-middle moves alone (warped after the zoom), or null. */
-function shapeOnly(bulge) {
-  const { strength, ...shape } = bulgeOf(bulge);
-  return hasBulge(shape) ? shape : null;
-}
-
-/**
- * How a transition's picture is drawn over a chunk whose frames have frame zooms `zooms` (transitionLayers). Each
- * frame draws the picture over a frame zoomed by its [zx, zy] in its own coordinates (the web editor's
- * frameDirection with `zoom`), shaped last (its bows, corners and side middles) on a canvas `reach` larger:
- * - `direct` (flat, fisheye, tiny planet, unbent): its own v360, h_fov/v_fov zoomed each frame (zoomedView). A fisheye
- *   zoomed out past the 360° v360 can draw is drawn at 360° and zoomed out from there (`zoomOut`), so what lies more
- *   than 180° off its middle (where it has wrapped round the ball) is left to the other picture.
- * - `canvas` (pannini, or a picture bent by a strength): its standard picture, aimed each frame (`stage`), made once
- *   into the frame drawn `f` times larger (the largest zoom the chunk needs, short of where it has faded out): pannini
- *   by extending its square's edges (`smear`, the web's clamp), a bent picture by a fixed map (`remap`, drawn at
- *   BULGE_SUPERSAMPLE). Each frame zooms into that with a flat-to-flat v360.
- * `fades`: the picture can run out of picture (frameAlpha below 1 somewhere), so the mix is counted per pixel.
- */
-export function transitionPictureLayout(pic, zooms, width, height) {
-  const kind = projectionOf(pic.projection);
-  const base = frameBase(width, height);
-  const strength = kind === 'flat' ? 0 : strengthOf(pic.bulge);
-  const shape = shapeOnly(pic.bulge);
-  const reach = shape ? bulgeReach(shape) : { x: 1, y: 1 };
-  const ss = BULGE_SUPERSAMPLE;
-  // A shaped picture is zoomed onto a canvas `reach` larger than the frame (at BULGE_SUPERSAMPLE), then warped into
-  // the frame at that supersample (`shapeOut`) and scaled down.
-  const drawn = shape ? { w: evenUp(width * ss * reach.x), h: evenUp(height * ss * reach.y) } : { w: width, h: height };
-  const shapeOut = shape ? { w: width * ss, h: height * ss } : null;
-  const view = projectedFieldOfView(width, height, pic.fov, kind, null);
-  const most = [Math.max(...zooms.map((z) => z[0])), Math.max(...zooms.map((z) => z[1]))];
-  const least = [Math.min(...zooms.map((z) => z[0])), Math.min(...zooms.map((z) => z[1]))];
-  const common = { kind, view, shape, reach, drawn, shapeOut, base, fov: pic.fov, strength };
-  if (kind !== 'pannini' && !strength) {
-    const widest = zoomedView(kind, view, [reach.x * most[0], reach.y * most[1]]);
-    const zoomOut = kind === 'fisheye' && Math.max(widest.hfov, widest.vfov) > 360;
-    return { ...common, mode: 'direct', zoomOut, fades: zoomOut };
-  }
-  const [k] = strengthCurves(kind, strength, pic.fov);
-  const fades = kind === 'pannini' || k < -1e-4;
-  // Past where its alpha reaches 0 the picture shows nothing: the canvas stops there.
-  let end = [Infinity, Infinity];
-  const q = base.vfov / base.hfov;
-  const r = panniniSideUnits(q, pic.fov);
-  if (kind === 'pannini') {
-    end = [(1 + ROOM_FADE) * r, ((1 + ROOM_FADE) * r) / q];
-  } else if (fades) {
-    const wide = base.hfov >= base.vfov;
-    const s = wide ? base.vfov / base.hfov : base.hfov / base.vfov;
-    const rho = (1 + ROOM_FADE) / (-k * radial(k, (pic.fov / 2) * RAD));
-    end = wide ? [rho, rho / s] : [rho / s, rho];
-  }
-  const f = [Math.min(reach.x * most[0], end[0] * 1.02), Math.min(reach.y * most[1], end[1] * 1.02)];
-  // Pixels per frame unit as the frame shows the picture at zoom 1 (no finer: a picture zoomed in is on its way out).
-  const per = [(drawn.w / reach.x / 2) / Math.max(1, least[0]), (drawn.h / reach.y / 2) / Math.max(1, least[1])];
-  if (kind === 'pannini' && !strength) {
-    // v360's square holds ±r frame widths across and ±r/q heights up; the canvas is that, cropped or extended.
-    const side = evenUp(Math.min(CANVAS_MAX, Math.max(2 * r * per[0], ((2 * r) / q) * per[1])));
-    const canvas = { w: evenUp(Math.min(CANVAS_MAX, (side * f[0]) / r)), h: evenUp(Math.min(CANVAS_MAX, (side * q * f[1]) / r)) };
-    const fitted = { w: (side * f[0]) / r, h: (side * q * f[1]) / r };
-    const stage = { output: 'pannini', ...fieldOfView(width, height, PANNINI_FOV), w: side, h: side };
-    // The canvas's own extent in frame units, after rounding to whole pixels.
-    const fc = [(f[0] * canvas.w) / fitted.w, (f[1] * canvas.h) / fitted.h];
-    return { ...common, mode: 'canvas', build: 'smear', fades, f: fc, canvas, stage };
-  }
-  const canvas = { w: evenUp(Math.min(CANVAS_MAX, 2 * ss * f[0] * per[0])), h: evenUp(Math.min(CANVAS_MAX, 2 * ss * f[1] * per[1])) };
-  // The standard picture's canvas: wide enough for every direction the frame drawn `f` larger shows.
-  const need = [0, 0];
-  const N = 32;
-  for (let i = 0; i <= N; i++) {
-    for (let j = 0; j <= N; j++) {
-      const d = frameVector(kind, ((2 * i) / N - 1) * f[0], ((2 * j) / N - 1) * f[1], base, pic.fov, strength);
-      if (kind === 'pannini') continue;
-      const off = Math.acos(clamp1(d[2]));
-      const phi = Math.atan2(d[1], d[0]);
-      const t = kind === 'fisheye' ? off : Math.tan(Math.min(off, 3.1) / 2);
-      need[0] = Math.max(need[0], t * Math.abs(Math.cos(phi)));
-      need[1] = Math.max(need[1], t * Math.abs(Math.sin(phi)));
-    }
-  }
-  let stage;
-  if (kind === 'pannini') {
-    const side = evenUp(Math.min(CANVAS_MAX, ss * Math.max(2 * r * per[0], ((2 * r) / q) * per[1])));
-    stage = { output: 'pannini', ...fieldOfView(width, height, PANNINI_FOV), w: side, h: side };
-  } else {
-    const fit = (want, fov) => {
-      if (kind === 'fisheye') {
-        const hc = Math.min(360, Math.max(1, (2 * want) / RAD));
-        return [hc, hc / fov];
-      }
-      const hc = Math.min(359, Math.max(1, (4 * Math.atan(want)) / RAD));
-      return [hc, Math.tan((hc * RAD) / 4) / Math.tan((Math.min(fov, 359) * RAD) / 4)];
-    };
-    const [hfov, sx] = fit(need[0], view.hfov);
-    const [vfov, sy] = fit(need[1], view.vfov);
-    stage = {
-      output: PROJECTION_V360[kind], hfov, vfov,
-      w: evenUp(Math.min(CANVAS_MAX, Math.max(16, 2 * ss * sx * per[0]))),
-      h: evenUp(Math.min(CANVAS_MAX, Math.max(16, 2 * ss * sy * per[1]))),
-    };
-  }
-  return { ...common, mode: 'canvas', build: 'remap', fades, f, canvas, stage };
-}
-
-/** A bent picture's standard-picture point (-1..1 across its stage canvas, y up) that shows direction `d`. */
-function stagePoint(layout, d) {
-  const { kind, stage } = layout;
-  if (kind === 'pannini') return [Math.sin(Math.atan2(d[0], d[2])) / PANNINI_EDGE, d[1] / Math.sqrt(Math.max(1e-12, 1 - d[1] * d[1]))];
-  const off = Math.acos(clamp1(d[2]));
-  const phi = Math.atan2(d[1], d[0]);
-  if (kind === 'fisheye') return [(off * Math.cos(phi)) / ((stage.hfov * RAD) / 2), (off * Math.sin(phi)) / ((stage.vfov * RAD) / 2)];
-  const t = Math.tan(Math.min(off, 3.13) / 2);
-  return [(t * Math.cos(phi)) / Math.tan((stage.hfov * RAD) / 4), (t * Math.sin(phi)) / Math.tan((stage.vfov * RAD) / 4)];
-}
-
-/** Writes a one-frame PGM (16-bit when `max` > 255). */
-function writePgm(file, w, h, data, max) {
-  const head = Buffer.from(`P5\n${w} ${h}\n${max}\n`);
-  let body;
-  if (max > 255) {
-    body = Buffer.alloc(w * h * 2);
-    for (let i = 0; i < w * h; i++) body.writeUInt16BE(data[i], i * 2);
-  } else {
-    body = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-  }
-  fs.writeFileSync(file, Buffer.concat([head, body]));
-}
-
-/**
- * The fixed maps of a transition picture, written next to the chunk (`prefix`): for a canvas picture `x`, `y` (a bent
- * picture's frame drawn `f` larger, from its standard picture) and `alpha` (frameAlpha over that frame) when it
- * fades; for a shaped picture `sx`, `sy` (the shape's warp, bulgeWarp).
- */
-export function writeTransitionMaps(layout, prefix) {
-  const files = {};
-  if (layout.mode === 'canvas') {
-    const { canvas, f, base, kind, fov, strength } = layout;
-    const remap = layout.build === 'remap';
-    const xs = remap ? new Uint16Array(canvas.w * canvas.h) : null;
-    const ys = remap ? new Uint16Array(canvas.w * canvas.h) : null;
-    const as = layout.fades ? new Uint8Array(canvas.w * canvas.h) : null;
-    for (let Y = 0; Y < canvas.h; Y++) {
-      const fv = (1 - (2 * Y + 1) / canvas.h) * f[1];
-      for (let X = 0; X < canvas.w; X++) {
-        const fu = ((2 * X + 1) / canvas.w - 1) * f[0];
-        const i = Y * canvas.w + X;
-        if (remap) {
-          const { stage } = layout;
-          const [xn, yn] = stagePoint(layout, frameVector(kind, fu, fv, base, fov, strength));
-          xs[i] = Math.min(stage.w - 1, Math.max(0, Math.floor(((xn + 1) / 2) * stage.w)));
-          ys[i] = Math.min(stage.h - 1, Math.max(0, Math.floor(((1 - yn) / 2) * stage.h)));
-        }
-        if (as) as[i] = Math.round(255 * Math.min(1, Math.max(0, 1 + frameRoom(kind, fu, fv, base, fov, strength) / ROOM_FADE)));
-      }
-    }
-    if (remap) {
-      files.x = `${prefix}-x.pgm`;
-      files.y = `${prefix}-y.pgm`;
-      writePgm(files.x, canvas.w, canvas.h, xs, 65535);
-      writePgm(files.y, canvas.w, canvas.h, ys, 65535);
-    }
-    if (as) {
-      files.alpha = `${prefix}-a.pgm`;
-      writePgm(files.alpha, canvas.w, canvas.h, as, 255);
-    }
-  }
-  if (layout.shape) {
-    const { drawn, reach, shape, shapeOut } = layout;
-    const sx = new Uint16Array(shapeOut.w * shapeOut.h);
-    const sy = new Uint16Array(shapeOut.w * shapeOut.h);
-    for (let Y = 0; Y < shapeOut.h; Y++) {
-      const v = 1 - (2 * Y + 1) / shapeOut.h;
-      for (let X = 0; X < shapeOut.w; X++) {
-        const u = (2 * X + 1) / shapeOut.w - 1;
-        const [bx, by] = bulgeWarp(shape, u, v);
-        const i = Y * shapeOut.w + X;
-        sx[i] = Math.min(drawn.w - 1, Math.max(0, Math.floor(((bx / reach.x + 1) / 2) * drawn.w)));
-        sy[i] = Math.min(drawn.h - 1, Math.max(0, Math.floor(((1 - by / reach.y) / 2) * drawn.h)));
-      }
-    }
-    files.sx = `${prefix}-sx.pgm`;
-    files.sy = `${prefix}-sy.pgm`;
-    writePgm(files.sx, shapeOut.w, shapeOut.h, sx, 65535);
-    writePgm(files.sy, shapeOut.w, shapeOut.h, sy, 65535);
-  }
-  return files;
-}
-
-/**
- * What one transition picture's v360s are set to at frame zoom `zoom`: `view` the h_fov/v_fov of its own v360 (direct
- * only), `zoom` the h_fov/v_fov of the flat-to-flat zoom that follows (null when there is none).
- */
-export function transitionPictureViews(layout, zoom) {
-  const { reach } = layout;
-  if (layout.mode === 'direct') {
-    const want = zoomedView(layout.kind, layout.view, [reach.x * zoom[0], reach.y * zoom[1]]);
-    if (!layout.zoomOut) return { view: want, zoom: null };
-    // Drawn at no more than 360°, then zoomed out flat-to-flat by what is left (equidistant: the angle over 360).
-    const view = { hfov: Math.min(360, want.hfov), vfov: Math.min(360, want.vfov) };
-    const out = [want.hfov / view.hfov, want.vfov / view.vfov];
-    return { view, zoom: { hfov: (2 * Math.atan(out[0])) / RAD, vfov: (2 * Math.atan(out[1])) / RAD } };
-  }
-  const { f } = layout;
-  return { view: null, zoom: { hfov: (2 * Math.atan((reach.x * zoom[0]) / f[0])) / RAD, vfov: (2 * Math.atan((reach.y * zoom[1]) / f[1])) / RAD } };
-}
-
-/** One map file as a filter source that holds for every frame (its one frame sits far before any video time). */
-const mapSource = (file, fmt) => `movie=filename='${filterPath(file)}',format=${fmt},setpts=PTS-1000000/TB`;
-
-/**
- * The filters of one transition picture, from `[t${tag}]` to `[p${tag}]`, at its first frame's aim (yaw stays there:
- * the scroll before turns it) and zoom; sendcmd moves them (transitionCommands). `alpha` puts an alpha plane on the
- * output (gbrap).
- */
-function transitionPictureGraph(tag, layout, angle, zoom, files, { width, height, alpha }) {
-  const aim = `yaw=${angle.yaw.toFixed(4)}:pitch=${angle.pitch.toFixed(4)}:roll=${angle.roll.toFixed(4)}`;
-  const views = transitionPictureViews(layout, zoom);
-  const { drawn } = layout;
-  const flatZoom = (z) => `v360@${tag}z=input=flat:output=flat:ih_fov=90:iv_fov=90:h_fov=${z.hfov.toFixed(6)}:v_fov=${z.vfov.toFixed(6)}:w=${drawn.w}:h=${drawn.h}:interp=linear`;
-  let g;
-  if (layout.mode === 'direct') {
-    g = `[t${tag}]v360@${tag}=input=e:output=${PROJECTION_V360[layout.kind]}:${aim}:h_fov=${views.view.hfov.toFixed(4)}:v_fov=${views.view.vfov.toFixed(4)}`
-      + `:w=${drawn.w}:h=${drawn.h}:interp=linear:reset_rot=1`;
-    // The zoom-out's ih_fov 90 is the frame drawn at 360°: v360 then leaves what lies past it transparent.
-    if (layout.zoomOut) g += `,format=gbrap,${flatZoom(views.zoom)}`;
-  } else {
-    const { stage, canvas } = layout;
-    g = `[t${tag}]v360@${tag}=input=e:output=${stage.output}:${aim}:h_fov=${(+stage.hfov).toFixed(4)}:v_fov=${(+stage.vfov).toFixed(4)}`
-      + `:w=${stage.w}:h=${stage.h}:interp=linear:reset_rot=1,format=gbrap`;
-    if (layout.build === 'smear') {
-      // The square cropped to the canvas, or extended past its edges by their last pixels (frameVector's clamp).
-      const cw = Math.min(stage.w, canvas.w);
-      const ch = Math.min(stage.h, canvas.h);
-      const l = Math.floor((canvas.w - cw) / 2);
-      const t = Math.floor((canvas.h - ch) / 2);
-      g += `,crop=${cw}:${ch}`;
-      if (cw < canvas.w || ch < canvas.h) {
-        g += `,pad=${canvas.w}:${canvas.h}:${l}:${t},fillborders=left=${l}:right=${canvas.w - cw - l}:top=${t}:bottom=${canvas.h - ch - t}:mode=smear`;
-      }
-      g += `[${tag}c];`;
-    } else {
-      g += `[${tag}s];${mapSource(files.x, 'gray16le')}[${tag}mx];${mapSource(files.y, 'gray16le')}[${tag}my];`
-        + `[${tag}s][${tag}mx][${tag}my]remap=fill=black,format=gbrap[${tag}c];`;
-    }
-    if (files.alpha) g += `${mapSource(files.alpha, 'gray')}[${tag}ma];[${tag}c][${tag}ma]alphamerge,`;
-    else g += `[${tag}c]`;
-    g += flatZoom(views.zoom);
-  }
-  if (files.sx) {
-    g += `,format=gbrap[${tag}z];${mapSource(files.sx, 'gray16le')}[${tag}nx];${mapSource(files.sy, 'gray16le')}[${tag}ny];`
-      + `[${tag}z][${tag}nx][${tag}ny]remap=fill=black,scale=${width}:${height}:flags=area`;
-  }
-  return `${g}${alpha ? ',format=gbrap' : ''}[p${tag}]`;
-}
-
-/** The per-pixel mix of the two pictures' alphas at weight `w`: the new picture's share (transitionMix), 0..255. */
-const mixExpr = (w) => {
-  const a = (1 - w).toFixed(6);
-  const b = w.toFixed(6);
-  return `if(lt(${a}*A+${b}*B\\,0.0255)\\,${(255 * w).toFixed(4)}\\,255*${b}*B/(${a}*A+${b}*B))`;
-};
-
-/**
- * The sendcmd lines of a transition chunk. Yaw turns the equirect before both pictures (a scroll, as in a pitch pan:
- * the command at frame n is the step to frame n+1), pitch and roll go to each picture's v360 (`angles`, absolute, so
- * stabilized chunks use it too), then each picture's zoom (`zooms`, per frame [from, to] each [zx, zy]) and the mix by
- * the new picture's `weights`: per pixel (blend@m's expression) with `alpha`, else by the weight alone (its opacity).
- * Only what changes is sent: each v360 command rebuilds its maps.
- */
-export function transitionCommands(angles, zooms, weights, { num, den, layouts, alpha }) {
-  const lines = [];
-  const last = {};
-  const send = (parts, key, cmd, value) => {
-    if (last[key] === value) return;
-    last[key] = value;
-    parts.push(`${cmd} ${value}`);
-  };
-  const views0 = layouts.map((layout, side) => transitionPictureViews(layout, zooms[0][side]));
-  layouts.forEach((layout, side) => {
-    const tag = side ? 'b' : 'a';
-    last[`${tag}pitch`] = angles[0].pitch.toFixed(4);
-    last[`${tag}roll`] = angles[0].roll.toFixed(4);
-    if (views0[side].view) [last[`${tag}h`], last[`${tag}v`]] = [views0[side].view.hfov.toFixed(4), views0[side].view.vfov.toFixed(4)];
-    if (views0[side].zoom) [last[`${tag}zh`], last[`${tag}zv`]] = [views0[side].zoom.hfov.toFixed(6), views0[side].zoom.vfov.toFixed(6)];
-  });
-  last.m = alpha ? mixExpr(weights[0]) : (1 - weights[0]).toFixed(4);
-  for (let n = 0; n < angles.length; n++) {
-    const a = angles[n];
-    const parts = [];
-    if (n < angles.length - 1) {
-      const step = normalizeAngle(angles[n + 1].yaw - a.yaw) / 360;
-      parts.push(`scroll horizontal ${step.toFixed(8)}`);
-    }
-    layouts.forEach((layout, side) => {
-      const tag = side ? 'b' : 'a';
-      send(parts, `${tag}pitch`, `v360@${tag} pitch`, a.pitch.toFixed(4));
-      send(parts, `${tag}roll`, `v360@${tag} roll`, a.roll.toFixed(4));
-      const views = transitionPictureViews(layout, zooms[n][side]);
-      if (views.view) {
-        send(parts, `${tag}h`, `v360@${tag} h_fov`, views.view.hfov.toFixed(4));
-        send(parts, `${tag}v`, `v360@${tag} v_fov`, views.view.vfov.toFixed(4));
-      }
-      if (views.zoom) {
-        send(parts, `${tag}zh`, `v360@${tag}z h_fov`, views.zoom.hfov.toFixed(6));
-        send(parts, `${tag}zv`, `v360@${tag}z v_fov`, views.zoom.vfov.toFixed(6));
-      }
-    });
-    if (alpha) send(parts, 'm', 'blend@m c0_expr', mixExpr(weights[n]));
-    else send(parts, 'm', 'blend@m all_opacity', (1 - weights[n]).toFixed(4));
-    if (parts.length) lines.push(`${seekTimestamp(n, num, den)} ${parts.join(', ')};`);
-  }
-  return `${lines.join('\n')}\n`;
-}
-
-/** How many frames' worth of pixels the largest picture of a transition segment draws at once (1: the frame's own). */
-export function transitionDrawnScale(seg, width, height) {
-  const from = { projection: seg.projection, fov: seg.fromFov ?? FOV_DEFAULT, bulge: seg.bulge ?? null };
-  const to = { projection: seg.toProjection, fov: seg.toFov ?? FOV_DEFAULT, bulge: seg.toBulge ?? null };
-  const zooms = transitionZooms(from, to, Array.from({ length: 21 }, (_, i) => i / 20), width, height);
-  let most = 1;
-  [from, to].forEach((pic, side) => {
-    const layout = transitionPictureLayout(pic, zooms.map((z) => z[side]), width, height);
-    for (const size of [layout.drawn, layout.canvas, layout.stage, layout.shapeOut]) if (size) most = Math.max(most, (size.w * size.h) / (width * height));
-  });
-  return most;
-}
-
-/** The frame zooms of a transition chunk: per frame, [from, to] each [zx, zy] (transitionLayers at its progress `p`). */
-export function transitionZooms(from, to, ps, width, height) {
-  const base = frameBase(width, height);
-  return ps.map((p) => transitionLayers({ ...from, mix: { ...to, p } }, base).map((layer) => layer.zoom));
-}
-
-/**
- * A transition between two pictures (`blend` or `planet`, see planSegments): one ffmpeg that draws the chunk twice,
- * each picture by its own camera on the same per-frame aim, at its frame zoom (transitionZooms) so the two meet in the
- * middle as the web editor's live view draws them, and mixes them frame by frame: by the new picture's `weights`
- * alone, or, where a picture can run out of picture, per pixel (transitionMix), so the other one shows there.
+ * A transition between two pictures (`blend` or `planet`, see planSegments), drawn as the web editor's live view draws
+ * it (morph.js): one picture bent from the first camera into the second on the same per-frame aim (`angles`, absolute,
+ * so stabilized chunks use it too), each fitted to the other by its frame zoom (transitionLayers at its progress `ps`),
+ * by the new camera's `weights`. One ffmpeg decodes the source's equirect frames, each is drawn here (bendFrame), and
+ * a second ffmpeg encodes them, with the overlay and the watermark as any chunk.
  */
 async function renderTransition(src, out, {
-  start, frames, angles, ps, weights, from, to, width, height, preset, crf, threads = 2, watermark = false, overlay = null,
-  num, den, ff, tmp, chunkIndex,
+  start, frames, angles, ps, weights, from, to, width, height, srcWidth, srcHeight, preset, crf, threads = 2, watermark = false,
+  overlay = null, num, den, ff = (args) => runFfmpeg(args),
 }) {
-  const zooms = transitionZooms(from, to, ps, width, height);
-  const layouts = [from, to].map((pic, side) => transitionPictureLayout(pic, zooms.map((z) => z[side]), width, height));
-  const alpha = layouts.some((layout) => layout.fades);
-  const files = layouts.map((layout, side) => writeTransitionMaps(layout, path.join(tmp, `blend-${chunkIndex}-${side ? 'b' : 'a'}`)));
-  const cmdFile = path.join(tmp, `blend-${chunkIndex}.cmd`);
-  fs.writeFileSync(cmdFile, transitionCommands(angles, zooms, weights, { num, den, layouts, alpha }));
-  const pictures = layouts.map((layout, side) => transitionPictureGraph(side ? 'b' : 'a', layout, angles[0], zooms[0][side], files[side], { width, height, alpha }));
-  let graph = `[0:v]setpts=PTS-STARTPTS,sendcmd=f='${filterPath(cmdFile)}',scroll=horizontal=0:hpos=0,split=2[ta][tb];${pictures.join(';')};`;
-  if (alpha) {
-    graph += '[pa]split[ca][qa];[qa]alphaextract[aa];[pb]split[cb][qb];[qb]alphaextract[ab];'
-      + `[aa][ab]blend@m=c0_expr='${mixExpr(weights[0]).replace(/\\,/g, ',')}'[am];[cb][am]alphamerge[ob];[ca][ob]overlay=format=gbrp,format=yuv420p`;
-  } else {
-    graph += `[pa][pb]blend@m=all_mode=normal:all_opacity=${(1 - weights[0]).toFixed(4)}`;
-  }
-  const chain = withOverlay(`${graph},setpts=PTS-STARTPTS`, overlay);
-  const args = [
-    '-hide_banner', '-loglevel', 'error', '-y',
+  const base = frameBase(width, height);
+  const decode = [
+    '-hide_banner', '-loglevel', 'error',
     '-threads', String(threads),
-    '-filter_threads', String(threads),
     '-ss', String(start), '-i', src,
-    '-filter_complex_threads', String(threads),
+    '-frames:v', String(frames),
+    '-an', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1',
+  ];
+  const chain = withOverlay('format=yuv420p,setpts=PTS-STARTPTS', overlay);
+  const encode = [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-s', `${width}x${height}`, '-framerate', rateArg(num, den), '-i', 'pipe:0',
   ];
   if (watermark) {
-    args.push('-i', WATERMARK, '-filter_complex', watermarkOverlay(width, height, `${chain}[base];[base]`));
+    encode.push('-i', WATERMARK, '-filter_complex_threads', String(threads), '-filter_complex', watermarkOverlay(width, height, `[0:v]${chain}[base];[base]`));
   } else {
-    args.push('-filter_complex', chain);
+    encode.push('-vf', chain);
   }
-  args.push(...x264Args({ threads, preset, crf, num, den, frames }), out);
-  await ff(args, 'pitch');
+  encode.push(...x264Args({ threads, preset, crf, num, den, frames }), out);
+  const frameIn = srcWidth * srcHeight * 3;
+  const frameOut = width * height * 3;
+  // The frames are drawn on a thread of their own (morphWorker.js), one at a time.
+  const worker = new Worker(new URL('./morphWorker.js', import.meta.url));
+  const failed = new Promise((_, reject) => worker.once('error', reject));
+  failed.catch(() => {});
+  const draw = async (frame, n) => {
+    const k = Math.min(n, frames - 1);
+    const layers = transitionLayers({ ...from, mix: { ...to, p: ps[k] } }, base);
+    const src = frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length);
+    const drawn = new Promise((resolve) => worker.once('message', resolve));
+    worker.postMessage({ src, sw: srcWidth, sh: srcHeight, w: width, h: height, layers, weight: weights[k], aim: angles[k], base }, [src]);
+    return Buffer.from(await Promise.race([drawn, failed]));
+  };
+  try {
+    await ff({ piped: { decode, encode, frameIn, frameOut, draw } }, 'pitch');
+  } finally {
+    await worker.terminate();
+  }
+}
+
+/** Runs an ffmpeg: its args, or a transition's two ffmpegs joined through a drawing step (`{ piped }`, runPiped). */
+function runFfmpeg(args, options = {}) {
+  return args.piped ? runPiped(FFMPEG, args.piped, options) : run(FFMPEG, args, options);
 }
 
 /**
@@ -1963,15 +1607,13 @@ export async function renderFromEdl(src, out, edl, {
   const seekOrigin = seekOriginSec(videoStream, info.format);
   const pixFmt = videoStream.pix_fmt || 'yuv420p';
   const audioStream = info.streams.find((s) => s.codec_type === 'audio');
-  const noteArgs = (args) => { if (trace) trace.push(args); };
+  const noteArgs = (args) => { if (trace) trace.push(...(args.piped ? [args.piped.decode, args.piped.encode] : [args])); };
 
   const segments = planSegments(sorted, cameras, cellPitches, duration, flat, view.rolls, view.fovs, { projections: view.projections, bulges: view.bulges, ranges });
 
   const limits = containerLimits();
-  // A bowed camera's v360 draws a larger view, and so may a transition's picture (its canvas): budget each ffmpeg for
-  // that size.
+  // A bowed camera's v360 draws a larger view: budget each ffmpeg for that size.
   const drawn = segments.reduce((most, seg) => {
-    if (seg.blend) most = Math.max(most, transitionDrawnScale(seg, width, height));
     if (!seg.bulge) return most;
     const reach = bulgeReach(seg.bulge, { projection: seg.projection, width, height, fov: seg.type === 'hold' ? seg.fov : seg.fromFov });
     return Math.max(most, BULGE_SUPERSAMPLE * BULGE_SUPERSAMPLE * reach.x * reach.y);
@@ -2109,10 +1751,10 @@ export async function renderFromEdl(src, out, edl, {
         angles,
         ps: poses.map((p) => p.p),
         weights: poses.map((p) => transitionWeight(seg.blend, seg.projection, p.p)),
+        srcWidth: videoStream.width,
+        srcHeight: videoStream.height,
         from: { projection: seg.projection, fov: seg.fromFov ?? FOV_DEFAULT, bulge: seg.bulge ?? null },
         to: { projection: seg.toProjection, fov: seg.toFov ?? FOV_DEFAULT, bulge: seg.toBulge ?? null },
-        tmp,
-        chunkIndex: i,
       });
     } else if (stabilization && !seg.flat) {
       const pose = (n) => panPose(seg.fromYaw, seg.toYaw, seg.fromPitch ?? 0, seg.toPitch ?? seg.fromPitch ?? 0, seg.index0 + n, seg.panFrames, panExtra(seg));
@@ -2210,10 +1852,10 @@ export async function renderFromEdl(src, out, edl, {
         measureRss: ffmpegRssBytes,
         exec: (args) => {
           noteArgs(args);
-          if (flat && args.some((arg) => String(arg).includes('v360'))) {
+          if (flat && (args.piped || args.some((arg) => String(arg).includes('v360')))) {
             throw new Error('flat render must not use v360');
           }
-          return run(FFMPEG, args, { signal: pass.signal });
+          return runFfmpeg(args, { signal: pass.signal });
         },
       }),
       runOne: async ({ item, index, slots, limiter }) => {
