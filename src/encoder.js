@@ -138,15 +138,24 @@ export function runPiped(bin, { decode, encode, frameIn, frameOut, draw }, { sig
       else fail(exitError('enc', c, closeSignal));
     });
     (async () => {
-      let pending = Buffer.alloc(0);
+      // Each frame is filled in place from the pipe's pieces (64 KB each): joining the pieces onto what came
+      // before copied a 360 frame's tens of MB once per piece, seconds a frame.
+      let frame = Buffer.allocUnsafe(frameIn);
+      let filled = 0;
       let n = 0;
       for await (const chunk of dec.stdout) {
         if (failed) return;
-        pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
-        while (pending.length >= frameIn) {
-          const frame = pending.subarray(0, frameIn);
-          pending = pending.subarray(frameIn);
-          const out = await draw(Buffer.from(frame), n++);
+        let at = 0;
+        while (at < chunk.length) {
+          const take = Math.min(frameIn - filled, chunk.length - at);
+          chunk.copy(frame, filled, at, at + take);
+          filled += take;
+          at += take;
+          if (filled < frameIn) break;
+          const full = frame;
+          frame = Buffer.allocUnsafe(frameIn);
+          filled = 0;
+          const out = await draw(full, n++);
           if (out.length !== frameOut) throw new Error(`a drawn frame is ${out.length} bytes, not ${frameOut}`);
           if (!enc.stdin.write(out)) await new Promise((r) => enc.stdin.once('drain', r));
           if (failed) return;

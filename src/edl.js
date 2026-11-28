@@ -1386,7 +1386,10 @@ async function renderTransition(src, out, {
   const draw = async (frame, n) => {
     const k = Math.min(n, frames - 1);
     const layers = transitionLayers({ ...from, mix: { ...to, p: ps[k] } }, base);
-    const src = frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length);
+    // The frame owns its whole buffer (runPiped), so it moves to the worker without a copy.
+    const src = frame.byteOffset === 0 && frame.buffer.byteLength === frame.length
+      ? frame.buffer
+      : frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.length);
     const drawn = new Promise((resolve) => worker.once('message', resolve));
     worker.postMessage({ src, sw: srcWidth, sh: srcHeight, w: width, h: height, layers, weight: weights[k], aim: angles[k], base }, [src]);
     return Buffer.from(await Promise.race([drawn, failed]));
